@@ -1,0 +1,408 @@
+"""Context-management compaction for Vanillux2Agent's model-facing history.
+
+``agent.py`` keeps an append-only, never-mutated raw event log (the same
+``messages`` list it has always kept, now holding full/untruncated tool
+output — see ``_RAW_OUTPUT_SAFETY_CAP_CHARS`` in agent.py for the one
+disk-safety exception). Before every LLM call, :func:`build_model_messages`
+rebuilds a *compacted* model-facing view from that raw log from scratch. It
+never mutates the raw log; the rebuild is a pure function of the raw log plus
+config, except for the one side effect of writing spill files to disk (see
+"Determinism" below).
+
+Two independent passes:
+
+* **Stubbing** (Feature 1): a file-write bash command (heredoc/``tee``/
+  redirect) or Feature-3 edit-tool call has its *request* payload (the bash
+  command string, or the edit tool's bulky arguments) replaced with a short
+  stub once it is superseded by a later write to the same path, or once it
+  falls outside the trailing ``write_recency_keep``-turn window. Concretely: a
+  write is kept in full only if it is *both* the latest write to its path
+  *and* within the last ``write_recency_keep`` turns; every other write to a
+  path that was ever written is eventually stubbed. This is a deliberate
+  reading of the spec's two stubbing conditions ("superseded" / "older than
+  K turns") as ANDed into one "keep-full" criterion, since that is what
+  actually bounds context growth on a long run — see the docstring on
+  Vanillux2Agent for the caveat.
+* **Truncation** (Feature 2): any tool-role message whose content exceeds
+  ``max_tool_output_tokens`` gets head/tail-line truncated, with the elided
+  middle spilled verbatim to disk.
+
+Determinism / idempotency: spill file paths are a pure function of the raw
+message's index (not a random uuid), so rebuilding from the same raw log
+twice always produces byte-identical output and always resolves to the same
+spill path. ``spilled_indices`` is a cache the agent instance owns across
+steps purely to avoid re-writing an unchanged spill file every step; it does
+not affect what the rebuild produces.
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+import logging
+import re
+import shlex
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+import litellm
+
+ExecFn = Callable[[str], Awaitable[Any]]
+
+EDIT_TOOL_NAMES = {"str_replace", "insert", "create", "apply_edits"}
+
+
+@dataclass
+class CompactionConfig:
+    stub_file_writes: bool = True
+    write_recency_keep: int = 2
+    max_tool_output_tokens: int = 2000
+    head_lines: int = 40
+    tail_lines: int = 40
+    spill_dir: str = "/tmp/harness_spill"
+
+
+@dataclass
+class CompactionStats:
+    stubbed_writes: int = 0
+    truncated_outputs: int = 0
+
+
+def count_tokens(text: str, model: str | None) -> int:
+    """Token count via the model's own tokenizer where litellm can resolve one."""
+    if not text:
+        return 0
+    if model:
+        try:
+            return litellm.token_counter(model=model, text=text)
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
+def _safe_json_loads(raw: Any) -> dict | None:
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Feature 1 — file-write detection + stubbing
+# ---------------------------------------------------------------------------
+
+# ``cat``/``tee`` heredocs, in either token order mini-swe-agent's own prompt
+# examples use (`cat > f << 'EOF' ...` and `cat <<'EOF' > f ...`).
+_HEREDOC_REDIRECT_FIRST = re.compile(
+    r"\b(?:cat|tee)\b[^\n<>|;&]*?>{1,2}\s*(?P<path>[^\s<>|;&]+)[^\n]*?"
+    r"<<-?\s*(?P<quote>['\"]?)(?P<delim>\w+)(?P=quote)\s*\n"
+    r"(?P<body>.*?)\n[ \t]*(?P=delim)\b",
+    re.DOTALL,
+)
+_HEREDOC_MARKER_FIRST = re.compile(
+    r"\b(?:cat|tee)\b[^\n<>|;&]*?<<-?\s*(?P<quote>['\"]?)(?P<delim>\w+)(?P=quote)[^\n]*?"
+    r">{1,2}\s*(?P<path>[^\s<>|;&]+)\s*\n"
+    r"(?P<body>.*?)\n[ \t]*(?P=delim)\b",
+    re.DOTALL,
+)
+# ``tee PATH`` (no heredoc — content typically arrives via a pipe).
+_TEE_RE = re.compile(r"\btee\b(?:\s+-\w+)*\s+(?P<path>(?!/dev/)[^\s<>|;&]+)")
+# Plain ``> PATH`` / ``>> PATH``, excluding fd redirects (``2>&1``, ``>&2``),
+# process substitution (``>(...)``), and /dev sinks.
+_REDIRECT_RE = re.compile(r"(?<![\d&])>{1,2}(?!\(|&)\s*(?P<path>(?!/dev/)[^\s<>|;&()]+)")
+
+
+def detect_bash_write_targets(command: str) -> list[tuple[str, int | None]]:
+    """Best-effort detection of file-mutating constructs in a bash command.
+
+    Returns ``[(path, approx_line_count_or_None), ...]``. Known limitations
+    (acceptable for a heuristic harness-level detector, not a shell parser):
+    doesn't understand ``sed -i``, Python ``open()``, or ``[[ a > b ]]``
+    string comparisons (the latter can false-positive as a redirect).
+    """
+    targets: list[tuple[str, int | None]] = []
+    seen_paths: set[str] = set()
+
+    for rx in (_HEREDOC_REDIRECT_FIRST, _HEREDOC_MARKER_FIRST):
+        for m in rx.finditer(command):
+            path = m.group("path")
+            body = m.group("body")
+            lines = body.count("\n") + 1 if body else 0
+            targets.append((path, lines))
+            seen_paths.add(path)
+
+    for m in _TEE_RE.finditer(command):
+        path = m.group("path")
+        if path not in seen_paths:
+            targets.append((path, None))
+            seen_paths.add(path)
+
+    for m in _REDIRECT_RE.finditer(command):
+        path = m.group("path")
+        if path not in seen_paths:
+            targets.append((path, None))
+            seen_paths.add(path)
+
+    return targets
+
+
+def _edit_tool_write_targets(name: str, args: dict) -> list[tuple[str, int | None]]:
+    path = args.get("path")
+    if not path:
+        return []
+    if name == "create":
+        content = args.get("content") or ""
+        return [(path, content.count("\n") + 1 if content else 0)]
+    if name == "insert":
+        text = args.get("text") or ""
+        return [(path, text.count("\n") + 1 if text else 0)]
+    if name == "str_replace":
+        new_string = args.get("new_string") or ""
+        return [(path, new_string.count("\n") + 1 if new_string else 0)]
+    if name == "apply_edits":
+        edits = args.get("edits") or []
+        if not edits:
+            return []
+        total = sum((e.get("new_string") or "").count("\n") + 1 for e in edits)
+        return [(path, total)]
+    return []
+
+
+@dataclass(frozen=True)
+class _WriteEvent:
+    turn_index: int  # index into raw_messages of the assistant message
+    call_index: int  # index into that message's tool_calls
+    path: str
+    lines: int | None
+
+
+def _iter_write_events(raw_messages: list[dict]) -> list[_WriteEvent]:
+    events: list[_WriteEvent] = []
+    for turn_index, msg in enumerate(raw_messages):
+        if msg.get("role") != "assistant":
+            continue
+        for call_index, tc in enumerate(msg.get("tool_calls") or []):
+            func = tc.get("function") or {}
+            name = func.get("name")
+            args = _safe_json_loads(func.get("arguments"))
+            if args is None:
+                continue
+            if name == "bash":
+                targets = detect_bash_write_targets(args.get("command") or "")
+            elif name in EDIT_TOOL_NAMES:
+                targets = _edit_tool_write_targets(name, args)
+            else:
+                targets = []
+            for path, lines in targets:
+                events.append(_WriteEvent(turn_index, call_index, path, lines))
+    return events
+
+
+def _turn_numbers(raw_messages: list[dict]) -> list[int]:
+    """One "turn" per assistant message; tool/system/user rows share it."""
+    turns: list[int] = []
+    n = 0
+    for msg in raw_messages:
+        if msg.get("role") == "assistant":
+            n += 1
+        turns.append(n)
+    return turns
+
+
+def _format_write_stub(writes: list[tuple[str, int | None]]) -> str:
+    parts = [
+        f"{lines} lines to {path}" if lines is not None else f"to {path}"
+        for path, lines in writes
+    ]
+    return f"[wrote {', '.join(parts)} — current content on disk; use read to inspect]"
+
+
+def _stub_tool_call(tc: dict, stub_text: str) -> dict:
+    func = dict(tc.get("function") or {})
+    if func.get("name") == "bash":
+        new_args = json.dumps({"command": stub_text})
+    else:
+        args = _safe_json_loads(func.get("arguments")) or {}
+        new_args = json.dumps({"path": args.get("path"), "note": stub_text})
+    func["arguments"] = new_args
+    new_tc = dict(tc)
+    new_tc["function"] = func
+    return new_tc
+
+
+def _maybe_stub_assistant_message(
+    msg: dict,
+    idx: int,
+    turn_no: int,
+    current_turn: int,
+    config: CompactionConfig,
+    call_write_info: dict[tuple[int, int], list[tuple[str, int | None]]],
+    last_turn_for_path: dict[str, int],
+    stats: CompactionStats,
+    logger: logging.Logger | None,
+) -> dict:
+    tool_calls = msg.get("tool_calls")
+    if not tool_calls:
+        return msg
+
+    new_calls = list(tool_calls)
+    changed = False
+    for call_index, tc in enumerate(tool_calls):
+        writes = call_write_info.get((idx, call_index))
+        if not writes:
+            continue
+
+        keep_full = any(
+            last_turn_for_path.get(path) == turn_no
+            and (current_turn - turn_no) <= config.write_recency_keep
+            for path, _lines in writes
+        )
+        if keep_full:
+            continue
+
+        stub_text = _format_write_stub(writes)
+        new_calls[call_index] = _stub_tool_call(tc, stub_text)
+        changed = True
+        stats.stubbed_writes += 1
+        if logger:
+            logger.info("context_management: stubbed write turn=%s %s", turn_no, stub_text)
+
+    if not changed:
+        return msg
+    new_msg = dict(msg)
+    new_msg["tool_calls"] = new_calls
+    return new_msg
+
+
+# ---------------------------------------------------------------------------
+# Feature 2 — tool-output truncation with spill-to-disk
+# ---------------------------------------------------------------------------
+
+_EXIT_CODE_RE = re.compile(r"\n\n\(exit_code=(-?\d+)\)\s*$")
+
+
+def _spill_path(config: CompactionConfig, raw_index: int) -> str:
+    # Deterministic (not a random uuid) so rebuilding the same raw log twice
+    # is idempotent — see module docstring.
+    return f"{config.spill_dir.rstrip('/')}/turn_{raw_index:05d}.txt"
+
+
+async def _write_spill(exec_fn: ExecFn, path: str, content: str) -> bool:
+    directory = path.rsplit("/", 1)[0]
+    delim = "VANILLUX2_SPILL_EOF"
+    body = content if content.endswith("\n") else content + "\n"
+    # Guard against `content` coincidentally containing a line equal to the
+    # delimiter, which would truncate the heredoc early.
+    while re.search(rf"(?m)^{re.escape(delim)}$", body):
+        delim += "_X"
+    script = (
+        f"mkdir -p {shlex.quote(directory)} && "
+        f"cat > {shlex.quote(path)} << '{delim}'\n"
+        f"{body}{delim}"
+    )
+    result = await exec_fn(script)
+    return result.return_code == 0
+
+
+async def _maybe_truncate_tool_message(
+    msg: dict,
+    idx: int,
+    config: CompactionConfig,
+    model: str | None,
+    exec_fn: ExecFn,
+    spilled_indices: set[int],
+    logger: logging.Logger | None,
+) -> tuple[dict, bool]:
+    content = msg.get("content")
+    if not isinstance(content, str) or not content:
+        return msg, False
+
+    if count_tokens(content, model) <= config.max_tool_output_tokens:
+        return msg, False
+
+    m = _EXIT_CODE_RE.search(content)
+    body, suffix = (content[: m.start()], content[m.start() :]) if m else (content, "")
+    lines = body.split("\n")
+    head_n, tail_n = config.head_lines, config.tail_lines
+    if len(lines) <= head_n + tail_n:
+        # Token-heavy but line-sparse (e.g. one huge minified line) — the
+        # head/tail-by-lines strategy has nothing useful to elide.
+        return msg, False
+
+    spill_path = _spill_path(config, idx)
+    if idx not in spilled_indices:
+        ok = await _write_spill(exec_fn, spill_path, body)
+        if not ok:
+            if logger:
+                logger.warning("context_management: spill write failed for %s; keeping full output", spill_path)
+            return msg, False
+        spilled_indices.add(idx)
+
+    elided = len(lines) - head_n - tail_n
+    head = "\n".join(lines[:head_n])
+    tail = "\n".join(lines[-tail_n:])
+    new_body = (
+        f"{head}\n\n[truncated {elided} lines — full output at {spill_path}; use read to inspect]\n\n{tail}"
+    )
+    if logger:
+        logger.info("context_management: truncated tool output, elided=%s spill=%s", elided, spill_path)
+
+    new_msg = dict(msg)
+    new_msg["content"] = new_body + suffix
+    return new_msg, True
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+async def build_model_messages(
+    raw_messages: list[dict],
+    *,
+    config: CompactionConfig,
+    model: str | None,
+    exec_fn: ExecFn,
+    spilled_indices: set[int],
+    stats: CompactionStats,
+    logger: logging.Logger | None = None,
+) -> list[dict]:
+    """Rebuild the model-facing message list from the raw event log.
+
+    Pure given (raw_messages, config, model) except for the spill side
+    effect on disk — see module docstring on why that doesn't break
+    determinism. Never mutates ``raw_messages`` or any of its elements.
+    """
+    turns = _turn_numbers(raw_messages)
+    current_turn = turns[-1] if turns else 0
+
+    call_write_info: dict[tuple[int, int], list[tuple[str, int | None]]] = {}
+    last_turn_for_path: dict[str, int] = {}
+    if config.stub_file_writes:
+        for event in _iter_write_events(raw_messages):
+            call_write_info.setdefault((event.turn_index, event.call_index), []).append(
+                (event.path, event.lines)
+            )
+            turn_no = turns[event.turn_index]
+            if turn_no > last_turn_for_path.get(event.path, -1):
+                last_turn_for_path[event.path] = turn_no
+
+    out: list[dict] = []
+    for idx, msg in enumerate(raw_messages):
+        role = msg.get("role")
+        if role == "assistant" and config.stub_file_writes and msg.get("tool_calls"):
+            msg = _maybe_stub_assistant_message(
+                msg, idx, turns[idx], current_turn, config, call_write_info, last_turn_for_path, stats, logger
+            )
+        elif role == "tool":
+            msg, did_truncate = await _maybe_truncate_tool_message(
+                msg, idx, config, model, exec_fn, spilled_indices, logger
+            )
+            if did_truncate:
+                stats.truncated_outputs += 1
+        out.append(msg)
+    return out

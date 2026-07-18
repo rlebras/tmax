@@ -42,7 +42,7 @@ is the *operational envelope* around that loop:
 
 | Agent | Kind | Runs | Tools | Action format | State | Context mgmt |
 |---|---|---|---|---|---|---|
-| **Vanillux2Agent** (default) | standalone `BaseAgent` | host-side | bash | structured tool-call | save/restore wrapper | none |
+| **Vanillux2Agent** (default) | standalone `BaseAgent` | host-side | bash + optional edit tools | structured tool-call | save/restore wrapper | stub stale writes + truncate/spill output |
 | **mini-swe-agent** | built-in installed agent | in sandbox | bash | text ` ```bash ``` ` block | persistent shell | none |
 | **terminus-2** | built-in `BaseAgent` | host-side | tmux keystrokes | JSON or XML plain | **persistent tmux** | proactive summarization |
 | **swe-agent** | built-in installed agent | in sandbox | bash + view/edit/submit | SWE-agent internal | persistent (in-sandbox) | history processors |
@@ -123,14 +123,20 @@ structured tool-calls** (it reads the `command` argument out of
 - **State:** save/restore persistent shell—each command is wrapped to restore
   `cwd`+`env` from `/tmp/.vanillux2/` before running and re-save after, so
   `cd`/`export` persist across turns without a long-lived shell process.
-- **Observation:** each tool result truncated to ~10 000 chars (head/tail with an
-  "elided" marker).
 - **Termination:** `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` submit marker,
   `max_steps`, optional cost limit, no-tool-call, or context-window overflow.
 - **Hardening:** exponential-backoff retry; auth / not-found / context-window /
   unsupported-param / permission errors abort immediately.
-- **Context management:** *none*—history grows until the context window is
-  exceeded, then the loop stops and submits whatever exists.
+- **Context management:** the raw trajectory (`trajectory.json`) is kept
+  full and untruncated, but the model only ever sees a *compacted rebuild* of
+  it, produced fresh every step: superseded/stale file-write commands are
+  replaced with a short `[wrote N lines to PATH — ...]` stub, and any tool
+  output over `max_tool_output_tokens` is head/tail-truncated with the elided
+  middle spilled to disk. An optional `str_replace`/`insert`/`create`/
+  `apply_edits`/`read` tool surface is registered alongside `bash` so small
+  edits never need to put a whole file back into the conversation. See
+  [`vanillux2_context_management.md`](vanillux2_context_management.md) for
+  the full design, config flags, and measured token savings.
 
 This is the recommended agent on harbor 0.6.6 when you want the mini-swe-agent
 recipe but a host-side loop you control. See the prior writeup in

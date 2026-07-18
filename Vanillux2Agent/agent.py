@@ -2,8 +2,16 @@
 
 This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
-marker, format-error recovery, and output truncation, but executes commands
-through Harbor's active environment and calls the model directly with LiteLLM.
+marker, and format-error recovery, but executes commands through Harbor's
+active environment and calls the model directly with LiteLLM.
+
+Context management: ``messages`` below is the raw, append-only event log
+(dumped verbatim to ``trajectory.json``); the model only ever sees a
+compacted rebuild of it, produced fresh every step by
+``context_management.build_model_messages``. See that module's docstring for
+the stubbing/truncation rules, and ``edit_tools.py`` for the optional
+str_replace/insert/create/apply_edits/read tools. Config flags for all of
+this are documented on ``Vanillux2Agent.__init__``.
 """
 
 from __future__ import annotations
@@ -22,17 +30,14 @@ from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from rl_data.generator.sample_solutions import (
-    SUBMIT_MARKER,
-    TOOL_SCHEMAS,
-    _extract_tool_call,
-)
+from rl_data.generator.sample_solutions import SUBMIT_MARKER, TOOL_SCHEMAS
 from rl_data.generator.vanillux_solver import (
     _format_error_message,
     _render_instance,
     _SYSTEM_TEMPLATE,
-    _truncate_observation,
 )
+
+from Vanillux2Agent import context_management, edit_tools
 
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
 
@@ -60,6 +65,10 @@ _DOCKER_EXEC_ERROR_RE = re.compile(
     r"(?ms)^Error: executing [^\n]*(?:docker-compose|docker compose)"
     r".*?: exit status \d+\s*$"
 )
+# Disk/memory safety net for the RAW log only — not context-management
+# truncation (that's context_management.py, applied to the model-facing view
+# only). Guards against a runaway command dumping gigabytes of output.
+_RAW_OUTPUT_SAFETY_CAP_CHARS = 2_000_000
 
 
 class Vanillux2Agent(BaseAgent):
@@ -86,8 +95,30 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        enable_edit_tools: bool = True,
+        stub_file_writes: bool = True,
+        write_recency_keep: int = 2,
+        max_tool_output_tokens: int = 2000,
+        head_lines: int = 40,
+        tail_lines: int = 40,
         **kwargs: Any,
     ) -> None:
+        """
+        Context-management flags (see context_management.py for the compaction
+        logic these drive):
+
+        enable_edit_tools: register str_replace/insert/create/apply_edits/read
+            alongside bash (Feature 3).
+        stub_file_writes: replace superseded/stale file-write payloads with a
+            short stub in the model-facing history (Feature 1).
+        write_recency_keep: a write stays un-stubbed only while it is both the
+            latest write to its path and within this many trailing turns.
+        max_tool_output_tokens: tool output above this token count is
+            head/tail-truncated with the elided middle spilled to disk
+            (Feature 2).
+        head_lines / tail_lines: how much of a truncated tool output to keep
+            verbatim at each end.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -100,6 +131,15 @@ class Vanillux2Agent(BaseAgent):
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
         self.cost: float = 0.0
+        self.enable_edit_tools = enable_edit_tools
+        self._compaction_config = context_management.CompactionConfig(
+            stub_file_writes=stub_file_writes,
+            write_recency_keep=write_recency_keep,
+            max_tool_output_tokens=max_tool_output_tokens,
+            head_lines=head_lines,
+            tail_lines=tail_lines,
+        )
+        self._tool_schemas = TOOL_SCHEMAS + (edit_tools.EDIT_TOOL_SCHEMAS if enable_edit_tools else [])
 
     async def setup(self, environment: BaseEnvironment) -> None:
         if not self.persistent_bash:
@@ -120,6 +160,9 @@ class Vanillux2Agent(BaseAgent):
         context: AgentContext,
     ) -> None:
         model = self.model_name or "anthropic/claude-haiku-4-5"
+        # The raw event log: append-only, never mutated, dumped verbatim to
+        # trajectory.json. The model only ever sees a compacted rebuild of
+        # this (see context_management.build_model_messages below).
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": _SYSTEM_TEMPLATE},
             {"role": "user", "content": _render_instance(instruction.strip())},
@@ -134,6 +177,12 @@ class Vanillux2Agent(BaseAgent):
         }
         format_errors = 0
 
+        def exec_fn(command: str) -> Any:
+            return self._execute_bash(command, environment)
+
+        spilled_indices: set[int] = set()
+        compaction_stats = context_management.CompactionStats()
+
         try:
             for step in range(self.max_steps):
                 logger.info("Step %s/%s", step + 1, self.max_steps)
@@ -146,9 +195,19 @@ class Vanillux2Agent(BaseAgent):
                     )
                     break
 
+                model_messages = await context_management.build_model_messages(
+                    messages,
+                    config=self._compaction_config,
+                    model=model,
+                    exec_fn=exec_fn,
+                    spilled_indices=spilled_indices,
+                    stats=compaction_stats,
+                    logger=logger,
+                )
+
                 t0 = time.monotonic()
                 try:
-                    response = await self._query_with_retry(model, messages)
+                    response = await self._query_with_retry(model, model_messages)
                 except litellm.exceptions.ContextWindowExceededError:
                     logger.warning("Context window exceeded; stopping current run")
                     break
@@ -161,7 +220,7 @@ class Vanillux2Agent(BaseAgent):
                     pass
 
                 msg = response.choices[0].message.model_dump()
-                action = _extract_tool_call(msg)
+                action = edit_tools.extract_action(msg)
                 if action["type"] == "no_tool_call":
                     msg.pop("tool_calls", None)
                     msg["content"] = msg.get("content") or ""
@@ -182,29 +241,40 @@ class Vanillux2Agent(BaseAgent):
 
                 messages.append(msg)
                 format_errors = 0
-                command = action.get("command") or ""
                 tool_call_id = action.get("tool_call_id") or ""
 
                 t1 = time.monotonic()
-                result = await self._execute_bash(command, environment)
-                exec_time = time.monotonic() - t1
+                if action["name"] == "bash":
+                    command = action["args"].get("command") or ""
+                    result = await self._execute_bash(command, environment)
+                    exec_time = time.monotonic() - t1
+                    tool_content = self._format_tool_result(result)
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "bash_s": round(exec_time, 1),
+                            "return_code": result.return_code,
+                            "cmd": command[:200],
+                        }
+                    )
+                else:
+                    tool_content = await edit_tools.dispatch(action["name"], action["args"], exec_fn)
+                    exec_time = time.monotonic() - t1
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "tool_s": round(exec_time, 1),
+                            "tool": action["name"],
+                        }
+                    )
 
-                tool_content = self._format_tool_result(result)
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call_id,
                         "content": tool_content,
-                    }
-                )
-
-                timing_log.append(
-                    {
-                        "step": step + 1,
-                        "llm_s": round(llm_time, 1),
-                        "bash_s": round(exec_time, 1),
-                        "return_code": result.return_code,
-                        "cmd": command[:200],
                     }
                 )
 
@@ -232,6 +302,12 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            context.metadata = {
+                "compaction": {
+                    "stubbed_writes": compaction_stats.stubbed_writes,
+                    "truncated_outputs": compaction_stats.truncated_outputs,
+                }
+            }
 
     async def _query_with_retry(
         self, model: str, messages: list[dict[str, Any]]
@@ -247,7 +323,7 @@ class Vanillux2Agent(BaseAgent):
                 completion_kwargs: dict[str, Any] = {
                     "model": model,
                     "messages": messages,
-                    "tools": TOOL_SCHEMAS,
+                    "tools": self._tool_schemas,
                     "max_tokens": self.max_tokens,
                     "api_base": api_base,
                     "timeout": llm_timeout,
@@ -335,10 +411,20 @@ class Vanillux2Agent(BaseAgent):
 
     @staticmethod
     def _format_tool_result(result: Any) -> str:
+        # This is the RAW log entry (see context_management.py) — no
+        # context-management truncation here, only a generous disk/memory
+        # safety net against a runaway command dumping gigabytes of output.
+        # The model-facing view is compacted separately, every step, from
+        # this full text via context_management.build_model_messages.
         output = result.stdout or ""
         if result.stderr:
             output += f"\n{result.stderr}" if output else result.stderr
         output = _COMPOSE_PROVIDER_RE.sub("", output)
         output = _DOCKER_EXEC_ERROR_RE.sub("", output).rstrip()
-        truncated = _truncate_observation(output) if output else "(no output)"
-        return f"{truncated}\n\n(exit_code={result.return_code})"
+        if len(output) > _RAW_OUTPUT_SAFETY_CAP_CHARS:
+            half = _RAW_OUTPUT_SAFETY_CAP_CHARS // 2
+            n_elided = len(output) - _RAW_OUTPUT_SAFETY_CAP_CHARS
+            output = f"{output[:half]}\n\n... [{n_elided} chars elided; raw safety cap] ...\n\n{output[-half:]}"
+        if not output:
+            output = "(no output)"
+        return f"{output}\n\n(exit_code={result.return_code})"
