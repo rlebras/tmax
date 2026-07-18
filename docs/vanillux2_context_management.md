@@ -86,10 +86,13 @@ in that case.
 ## Feature 3 — a real edit tool
 
 `str_replace` / `insert` / `create` / `apply_edits` / `read` are registered
-alongside `bash`. All run host-side: content is fetched via `exec_fn`
-(`cat`/`wc -l`/`sed -n ... | nl`), matched/mutated in Python, and written
-back atomically (temp file + `mv`, so a failed write never leaves a corrupt
-file on disk).
+alongside `bash`. All run host-side via a `ContainerOps` bundle
+(`Vanillux2Agent/container_ops.py`): content moves through
+`upload_bytes`/`download_bytes` (backed by harbor's `environment.upload_file`/
+`download_file`, i.e. `docker cp`), matched/mutated in Python, and written
+back atomically (upload to a temp path, then a tiny `mv` via `exec_fn` — see
+"Regression fixes" below for why content no longer goes through `exec_fn`
+directly).
 
 - `str_replace(path, old_string, new_string)` — whitespace-tolerant match
   (old_string's tokens joined by `\s+`, so indentation/spacing differences
@@ -105,18 +108,19 @@ file on disk).
   written.
 - `read(path, start, end)` — line-numbered, capped window (default 200
   lines), so a read is always anchorable and never dumps an unbounded file.
-  Also works on Feature 2's spill files.
+  Also works on Feature 2's spill files. Binary files (NUL byte or invalid
+  UTF-8 in the first 8KB) get a safe hex-preview summary instead of a crash
+  or garbled text.
+- `str_replace`/`insert`/`apply_edits` refuse cleanly on a binary file
+  (`error: ... appears to be binary ... use bash to inspect/modify it`) —
+  `create`'s content always arrives as valid-JSON-supplied text, so no
+  refusal is needed there.
 
-**Caveat:** tmax-9b was SFT/RL-trained exclusively on the single-`bash`-tool
-harness, and the vendored system prompt says "calling a tool other than
-`bash`... will cause your response to be rejected" — that prompt text is
-intentionally untouched (no prompt changes), so there's no expectation the
-model spontaneously discovers and uses these tools without a training
-update that teaches it to. They're registered because the harness needs to
-be ready for that, and because nothing about adding them is unsafe or
-regresses the bash-only path — but the near-term token savings come almost
-entirely from Features 1 and 2, which apply transparently to whatever the
-model actually does.
+The model is told about these tools and steered toward them for editing
+existing files (see the `system_template_multi_tool`/
+`instance_template_multi_tool` keys in `vanillux_prompts.yaml`, selected
+whenever `enable_edit_tools=True`) — see "Regression fixes" below for why
+this wasn't true in the first version of this feature.
 
 ## Config flags
 
@@ -170,6 +174,53 @@ did overflow (they may be shorter/cut off mid-generation rather than
 long-and-heavy, which the "largest file" / "most turns" proxies wouldn't
 necessarily catch).
 
+## Regression fixes
+
+The first version of this feature shipped with `enable_edit_tools=True` but
+the vendored bash-only system prompt still in place, and shipped content
+straight through `exec_fn`. On a real Beaker run, pass@1/pass@5 regressed
+(27.6%/43.8% → 26.7%/40.4%) for four reasons, all now fixed:
+
+1. **Edit tool never used** (0 `str_replace`, 0 `insert`, 29 non-bash calls
+   out of 15,271). The system prompt still said *"you must call the `bash`
+   tool... calling a tool other than `bash`... will cause your response to
+   be rejected"* — the model was told not to use the tools it had just been
+   given. Fixed by adding `system_template_multi_tool` /
+   `instance_template_multi_tool` / `format_error_template_multi_tool` as
+   new, additive keys in `vanillux_prompts.yaml` (the original bash-only
+   keys are untouched and still drive `vanillux_solver.py`'s RL/SFT
+   data-generation harness, which only ever registers the bash tool).
+2. **`OSError: Argument list too long`** (24 trials). Harbor's
+   `environment.exec()` ultimately runs `docker compose exec ... bash -c
+   "<command>"` via `asyncio.create_subprocess_exec` — the whole command is
+   one argv element, subject to the kernel's ARG_MAX. `_write_file_atomic`
+   and `_write_spill` were embedding unbounded file/output content there.
+3. **`ValueError: embedded null byte`** (6 trials). Same embedding — a
+   literal NUL in re-embedded content (e.g. read back from a binary file)
+   crashes subprocess argv construction outright, independent of size.
+4. **`BadRequestError: ... Unterminated string`** (1 trial). Not reproduced
+   in the stubbing code itself (`_stub_tool_call` already parses then
+   `json.dumps`-reserializes — it never string-splices a serialized
+   payload), but nothing validated a message was safe before resending it.
+
+Fixes 2 and 3 share one root cause and one fix: content now moves through a
+new `ContainerOps` bundle's `upload_bytes`/`download_bytes` (harbor's
+`environment.upload_file`/`download_file`, i.e. `docker cp` — never a
+command-line argument), with only tiny fixed-size commands (an atomic `mv`,
+and a POSIX `dirname`/`basename`/`cd`/`pwd` lookup — deliberately not GNU
+`realpath -m`, which minimal task images may not ship — to resolve a
+cwd-relative path against the persistent pseudo-cwd `_wrap_command`
+maintains, since `upload_file`/`download_file` bypass that wrapper) still
+going through `exec_fn`. This also gives true byte-level file reads instead
+of harbor's lossy `errors="replace"` str decode, which is what makes honest
+binary-file detection (`_looks_binary`) possible.
+
+Fix 4 is a defense-in-depth guard (`_ensure_json_safe`, applied to every
+message `build_model_messages` emits): any `tool_calls[].function.arguments`
+that doesn't independently `json.loads` gets replaced with a minimal valid
+stub, preserving the same `tool_call_id` so pairing with the following
+tool-response message stays intact, rather than being resent broken.
+
 ## Tests
 
 [`tests/vanillux2/`](../tests/vanillux2/) covers detection (heredoc in both
@@ -177,8 +228,13 @@ token orders, `tee`, redirects, false-positive avoidance for `2>&1`/`/dev/null`)
 stubbing (recency, supersession, the K-turn boundary, edit-tool payloads),
 fuzzy `str_replace` (0/1/2+ matches), atomicity (a failed write never
 corrupts the file), truncation (exit code + tail always preserved, spill
-round-trips), and determinism (rebuilding the same raw log twice is
-byte-identical, and the raw log itself is never mutated). Run with:
+round-trips), determinism (rebuilding the same raw log twice is
+byte-identical, and the raw log itself is never mutated), and the four
+regressions above: a >2MB `str_replace`/`create` with the exec-argv size
+instrumented directly, binary-file detection/refusal on null-byte/invalid-
+UTF-8 content, adversarial-content JSON round-trip assertions, and a
+`str_replace` call flowing model → `extract_action` → `dispatch` → disk →
+compact result end to end. Run with:
 
 ```
 uv run pytest tests/vanillux2
@@ -186,6 +242,8 @@ uv run pytest tests/vanillux2
 
 These tests import `context_management`/`edit_tools` directly by file path
 rather than through the `Vanillux2Agent` package, so they don't require
-`harbor` to be installed (only pure-Python logic plus a real local `bash` for
-the `exec_fn` fixture, which runs actual shell commands against a temp
-directory rather than a hand-rolled fake shell).
+`harbor` to be installed. The `ops` fixture (`ContainerOps`) runs `exec_fn`
+against real local `bash` and implements `upload_bytes`/`download_bytes` as
+plain local file writes/reads — the test "container" is just the local
+filesystem, so these exercise the actual commands/paths this code generates
+without a hand-rolled fake shell or a real Docker daemon.
