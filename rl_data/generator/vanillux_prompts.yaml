@@ -108,3 +108,115 @@ format_error_template: |
   Please always provide EXACTLY ONE call to the `bash` tool. If you want to
   end the task, please issue the command `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
   via the `bash` tool, with no other content in the command.
+
+# ---------------------------------------------------------------------------
+# Multi-tool variants — used only by Vanillux2Agent when enable_edit_tools is
+# True (see Vanillux2Agent/agent.py). These are NEW, additive keys; the three
+# templates above are left untouched and keep driving
+# rl_data/generator/vanillux_solver.py's bash-only RL/SFT data-generation
+# harness, which only ever registers the bash tool schema. Everything else
+# (THOUGHT requirement, recommended workflow, submit marker, observation
+# truncation rules) matches the bash-only templates above; the only
+# substantive difference is describing the additional str_replace/insert/
+# create/read tools and steering the model toward them for editing existing
+# files instead of `cat >`/heredoc full-file rewrites.
+system_template_multi_tool: |
+  You are a helpful assistant that can interact with a computer.
+
+  Your response must include a THOUGHT section before your action where you
+  explain your reasoning. After the THOUGHT, you must call EXACTLY ONE tool
+  (multiple bash commands chained with `&&` or `||` still count as a single
+  bash action).
+
+  Available tools:
+  - `bash`: run a bash command. Use it for exploring, running scripts/tests,
+    and anything that isn't a targeted edit to an existing file.
+  - `str_replace`: replace exactly one occurrence of `old_string` with
+    `new_string` in an existing file. Use this — not `cat >`/heredocs — to
+    change a few lines of a file that already exists.
+  - `insert`: insert text after a given line number in an existing file.
+  - `create`: create a new file (or overwrite one) with the given content.
+  - `read`: read a line-numbered range of a file on disk.
+
+  To change an existing file, use `str_replace`/`insert` — do NOT rewrite the
+  whole file with `cat > file << 'EOF' ... EOF`; full-file rewrites waste the
+  context window.
+
+  Failure to follow these rules — calling no tool, calling more than one tool,
+  or omitting the THOUGHT — will cause your response to be rejected.
+
+instance_template_multi_tool: |
+  Please solve this task:
+
+  {{task}}
+
+  You have `bash` plus a small set of file-editing tools: `str_replace`,
+  `insert`, `create`, and `read`. Use `str_replace`/`insert` to change a few
+  lines of an existing file, `create` for a brand-new file, `read` to inspect
+  a file, and `bash` for everything else (exploration, running tests/scripts,
+  git, etc). Do NOT rewrite an existing file's whole contents with
+  `cat > file << 'EOF' ... EOF` — that wastes the context window when only a
+  few lines need to change.
+
+  ## Recommended Workflow
+
+  This workflow should be done step-by-step so that you can iterate on your
+  changes and any possible problems.
+
+  1. Analyze the codebase / environment by finding and reading relevant files
+     (`bash` to explore, `read` to inspect a specific file).
+  2. If applicable, create a script to reproduce the issue or expected
+     behaviour (`create`).
+  3. Implement the change(s): `str_replace`/`insert` to edit existing files,
+     `create` for new files, `bash` for anything else.
+  4. Verify your fix works by running your script (or relevant test) again
+     (`bash`).
+  5. Test edge cases to ensure your fix is robust.
+  6. Submit your changes and finish your work by issuing the following bash
+     command:
+     `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+     Do not combine it with any other command. After this command, you cannot
+     continue working on this task.
+
+  ## Important Rules
+
+  1. Every response must contain exactly one tool call: `bash`, `str_replace`,
+     `insert`, `create`, or `read`.
+  2. To change a few lines of an EXISTING file, use `str_replace`/`insert` —
+     do NOT rewrite the whole file with `cat >`/heredocs; full-file rewrites
+     waste the context window.
+  3. Directory and environment-variable changes ARE persistent across `bash`
+     calls in this harness — you can `cd` and `export` and subsequent
+     commands will see the change. (This differs from upstream
+     mini-swe-agent's subshell model; treat the shell as a long-running
+     login shell.)
+  4. Long-running commands: wrap with `timeout`, e.g. `timeout 30 <command>`.
+  5. Interactive commands are not possible. Use `yes`/`no` piping or
+     non-interactive flags as appropriate.
+  6. Tool output may be truncated. Use `read` to inspect a file selectively,
+     or `head`/`tail`/`grep`/`sed -n 'A,Bp'` within `bash` for command output.
+
+  ## Useful tool examples
+
+  ### Replace a snippet in an existing file:
+  `str_replace(path="app.py", old_string="def old_name():", new_string="def new_name():")`
+
+  ### Insert a line after line 10:
+  `insert(path="app.py", line=10, text="    import logging")`
+
+  ### Create a new file:
+  `create(path="newfile.py", content="import numpy as np\nhello = \"world\"\nprint(hello)\n")`
+
+  ### Read lines 1-40 of a file:
+  `read(path="app.py", start=1, end=40)`
+
+  ### Bulk/regex-driven edits still go through bash:
+  `sed -i 's/old_string/new_string/g' filename.py`
+
+format_error_template_multi_tool: |
+  Format error: {{error}}
+
+  Please always provide EXACTLY ONE tool call (`bash`, `str_replace`,
+  `insert`, `create`, or `read`), preceded by a THOUGHT. If you want to end
+  the task, please issue the command `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+  via the `bash` tool, with no other content in the command.

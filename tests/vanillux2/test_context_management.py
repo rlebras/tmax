@@ -86,7 +86,7 @@ def test_detect_multiple_writes_in_one_command():
 # ---------------------------------------------------------------------------
 
 
-async def test_recent_sole_write_stays_unstubbed(exec_fn):
+async def test_recent_sole_write_stays_unstubbed(ops):
     raw = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "task"},
@@ -96,14 +96,14 @@ async def test_recent_sole_write_stays_unstubbed(exec_fn):
     config = cm.CompactionConfig(write_recency_keep=2)
     stats = cm.CompactionStats()
     out = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=stats
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
     )
     args = json.loads(out[2]["tool_calls"][0]["function"]["arguments"])
     assert args["command"] == "cat > f.py << 'EOF'\nprint(1)\nEOF"
     assert stats.stubbed_writes == 0
 
 
-async def test_stale_sole_write_gets_stubbed_past_recency_window(exec_fn):
+async def test_stale_sole_write_gets_stubbed_past_recency_window(ops):
     raw = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "task"},
@@ -119,7 +119,7 @@ async def test_stale_sole_write_gets_stubbed_past_recency_window(exec_fn):
     config = cm.CompactionConfig(write_recency_keep=2)
     stats = cm.CompactionStats()
     out = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=stats
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
     )
     args = json.loads(out[2]["tool_calls"][0]["function"]["arguments"])
     assert "wrote" in args["command"] and "f.py" in args["command"]
@@ -129,7 +129,7 @@ async def test_stale_sole_write_gets_stubbed_past_recency_window(exec_fn):
     assert out[3]["content"] == "(no output)\n\n(exit_code=0)"
 
 
-async def test_superseded_write_is_stubbed_even_if_recent(exec_fn):
+async def test_superseded_write_is_stubbed_even_if_recent(ops):
     raw = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "task"},
@@ -141,7 +141,7 @@ async def test_superseded_write_is_stubbed_even_if_recent(exec_fn):
     config = cm.CompactionConfig(write_recency_keep=2)
     stats = cm.CompactionStats()
     out = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=stats
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
     )
     turn1_args = json.loads(out[2]["tool_calls"][0]["function"]["arguments"])
     turn2_args = json.loads(out[4]["tool_calls"][0]["function"]["arguments"])
@@ -150,7 +150,7 @@ async def test_superseded_write_is_stubbed_even_if_recent(exec_fn):
     assert stats.stubbed_writes == 1
 
 
-async def test_edit_tool_write_gets_stubbed_and_keeps_path(exec_fn):
+async def test_edit_tool_write_gets_stubbed_and_keeps_path(ops):
     raw = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "task"},
@@ -166,7 +166,7 @@ async def test_edit_tool_write_gets_stubbed_and_keeps_path(exec_fn):
     config = cm.CompactionConfig(write_recency_keep=2)
     stats = cm.CompactionStats()
     out = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=stats
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
     )
     stubbed = json.loads(out[2]["tool_calls"][0]["function"]["arguments"])
     assert stubbed["path"] == "f.py"
@@ -174,7 +174,7 @@ async def test_edit_tool_write_gets_stubbed_and_keeps_path(exec_fn):
     assert "content" not in stubbed  # bulky payload dropped
 
 
-async def test_stubbing_disabled_leaves_history_untouched(exec_fn):
+async def test_stubbing_disabled_leaves_history_untouched(ops):
     raw = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "task"},
@@ -190,7 +190,7 @@ async def test_stubbing_disabled_leaves_history_untouched(exec_fn):
     config = cm.CompactionConfig(stub_file_writes=False)
     stats = cm.CompactionStats()
     out = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=stats
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
     )
     args = json.loads(out[2]["tool_calls"][0]["function"]["arguments"])
     assert args["command"] == "cat > f.py << 'EOF'\nprint(1)\nEOF"
@@ -202,7 +202,7 @@ async def test_stubbing_disabled_leaves_history_untouched(exec_fn):
 # ---------------------------------------------------------------------------
 
 
-async def test_truncate_preserves_exit_code_and_tail_and_spills_full_output(exec_fn, workdir):
+async def test_truncate_preserves_exit_code_and_tail_and_spills_full_output(ops, workdir):
     lines = [f"line{i}" for i in range(1, 201)]
     body = "\n".join(lines)
     content = f"{body}\n\n(exit_code=0)"
@@ -217,7 +217,7 @@ async def test_truncate_preserves_exit_code_and_tail_and_spills_full_output(exec
     )
     stats = cm.CompactionStats()
     out = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=stats
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
     )
     tool_content = out[3]["content"]
     assert "(exit_code=0)" in tool_content
@@ -232,7 +232,7 @@ async def test_truncate_preserves_exit_code_and_tail_and_spills_full_output(exec
     assert body in Path(spill_path).read_text()
 
 
-async def test_short_tool_output_is_not_truncated(exec_fn):
+async def test_short_tool_output_is_not_truncated(ops):
     raw = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "task"},
@@ -242,10 +242,148 @@ async def test_short_tool_output_is_not_truncated(exec_fn):
     config = cm.CompactionConfig(max_tool_output_tokens=2000)
     stats = cm.CompactionStats()
     out = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=stats
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
     )
     assert out[3]["content"] == "hi\n\n(exit_code=0)"
     assert stats.truncated_outputs == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression: Fix 2/3 — spilling large/binary-looking tool output must not crash
+# ---------------------------------------------------------------------------
+
+
+async def test_spill_multi_megabyte_output_does_not_use_exec_argv(ops, workdir):
+    lines = [f"line{i}: " + "x" * 200 for i in range(1, 20000)]
+    body = "\n".join(lines)
+    assert len(body) > 3_000_000
+    content = f"{body}\n\n(exit_code=0)"
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _assistant_bash("c1", "big_output_cmd"),
+        _tool("c1", content),
+    ]
+    config = cm.CompactionConfig(max_tool_output_tokens=10, spill_dir=str(workdir / "spill"))
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    assert stats.truncated_outputs == 1
+    spill_path = cm._spill_path(config, 3)
+    assert Path(spill_path).stat().st_size > 3_000_000
+
+
+async def test_spill_output_containing_null_byte_does_not_crash(ops, workdir):
+    # Enough lines that head/tail truncation actually fires (needs more than
+    # head_lines+tail_lines=80 lines); the null byte sits in the elided
+    # middle, so it only ever needs to survive the *spill* write, not
+    # display.
+    lines = [f"line{i}" for i in range(1, 101)]
+    lines[50] = "line51\x00\x01binary-ish-content-here"
+    body = "\n".join(lines)
+    content = f"{body}\n\n(exit_code=0)"
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _assistant_bash("c1", "weird_cmd"),
+        _tool("c1", content),
+    ]
+    config = cm.CompactionConfig(max_tool_output_tokens=10, spill_dir=str(workdir / "spill"))
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    assert stats.truncated_outputs == 1
+    spill_path = cm._spill_path(config, 3)
+    assert "\x00" in Path(spill_path).read_text(errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Regression: Fix 4 — every rebuilt message must round-trip through JSON
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_json_safe_repairs_malformed_arguments():
+    msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_broken",
+                "type": "function",
+                "function": {"name": "bash", "arguments": '{"command": "echo \\"unterminated'},
+            }
+        ],
+    }
+    fixed = cm._ensure_json_safe(msg, logger=None)
+    # round-trips cleanly now
+    json.dumps(fixed)
+    args = json.loads(fixed["tool_calls"][0]["function"]["arguments"])
+    assert "error" in args
+    # tool_call_id preserved so the paired tool-response message still lines up
+    assert fixed["tool_calls"][0]["id"] == "call_broken"
+
+
+def test_ensure_json_safe_leaves_valid_message_untouched():
+    msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "ls"}'}}
+        ],
+    }
+    fixed = cm._ensure_json_safe(msg, logger=None)
+    assert fixed == msg
+
+
+async def test_build_model_messages_repairs_malformed_raw_arguments_end_to_end(ops):
+    # Simulates a message that arrived in the raw log already malformed
+    # (e.g. an upstream tool-call-parser truncation artifact) — compaction
+    # itself never introduces this, but every message it emits must still be
+    # guaranteed JSON-safe regardless of what it inherited.
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_broken",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command": "cat > f.py << \'EOF\'\\nunterm'},
+                }
+            ],
+        },
+        _tool("call_broken", "(no output)\n\n(exit_code=0)"),
+    ]
+    config = cm.CompactionConfig()
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    for m in out:
+        json.dumps(m)  # every message must round-trip
+        for tc in m.get("tool_calls") or []:
+            json.loads(tc["function"]["arguments"])  # arguments must independently parse
+
+
+async def test_rebuilt_messages_always_json_dumpable_with_adversarial_content(ops):
+    adversarial = 'quotes " and \\ backslashes and \n newlines and \x00 null and emoji 🎉'
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _assistant_bash("c1", f"cat > f.py << 'EOF'\n{adversarial}\nEOF"),
+        _tool("c1", f"{adversarial}\n\n(exit_code=0)"),
+    ]
+    config = cm.CompactionConfig(write_recency_keep=0)  # force stubbing on this very turn
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    for m in out:
+        json.dumps(m)
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +391,7 @@ async def test_short_tool_output_is_not_truncated(exec_fn):
 # ---------------------------------------------------------------------------
 
 
-async def test_rebuild_is_deterministic_and_never_mutates_raw_log(exec_fn, workdir):
+async def test_rebuild_is_deterministic_and_never_mutates_raw_log(ops, workdir):
     body = "\n".join(f"line{i}" for i in range(1, 201))
     raw = [
         {"role": "system", "content": "sys"},
@@ -269,10 +407,10 @@ async def test_rebuild_is_deterministic_and_never_mutates_raw_log(exec_fn, workd
     config = cm.CompactionConfig(write_recency_keep=1, max_tool_output_tokens=10, spill_dir=str(workdir / "spill"))
 
     out1 = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=cm.CompactionStats()
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=cm.CompactionStats()
     )
     out2 = await cm.build_model_messages(
-        raw, config=config, model=None, exec_fn=exec_fn, spilled_indices=set(), stats=cm.CompactionStats()
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=cm.CompactionStats()
     )
 
     assert out1 == out2  # rebuilding from the same raw log twice is byte-identical

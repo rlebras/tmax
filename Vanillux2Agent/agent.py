@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -33,11 +34,15 @@ from harbor.models.agent.context import AgentContext
 from rl_data.generator.sample_solutions import SUBMIT_MARKER, TOOL_SCHEMAS
 from rl_data.generator.vanillux_solver import (
     _format_error_message,
+    _format_error_message_multi_tool,
     _render_instance,
+    _render_instance_multi_tool,
     _SYSTEM_TEMPLATE,
+    _SYSTEM_TEMPLATE_MULTI_TOOL,
 )
 
 from Vanillux2Agent import context_management, edit_tools
+from Vanillux2Agent.container_ops import ContainerOps
 
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
 
@@ -160,12 +165,14 @@ class Vanillux2Agent(BaseAgent):
         context: AgentContext,
     ) -> None:
         model = self.model_name or "anthropic/claude-haiku-4-5"
+        system_template = _SYSTEM_TEMPLATE_MULTI_TOOL if self.enable_edit_tools else _SYSTEM_TEMPLATE
+        render_instance = _render_instance_multi_tool if self.enable_edit_tools else _render_instance
         # The raw event log: append-only, never mutated, dumped verbatim to
         # trajectory.json. The model only ever sees a compacted rebuild of
         # this (see context_management.build_model_messages below).
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _SYSTEM_TEMPLATE},
-            {"role": "user", "content": _render_instance(instruction.strip())},
+            {"role": "system", "content": system_template},
+            {"role": "user", "content": render_instance(instruction.strip())},
         ]
 
         timing_log: list[dict[str, Any]] = []
@@ -179,6 +186,34 @@ class Vanillux2Agent(BaseAgent):
 
         def exec_fn(command: str) -> Any:
             return self._execute_bash(command, environment)
+
+        async def upload_bytes(content: bytes, remote_path: str) -> None:
+            fd, local_tmp = tempfile.mkstemp(prefix="vanillux2_upload_")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(content)
+                await environment.upload_file(local_tmp, remote_path)
+            finally:
+                try:
+                    os.unlink(local_tmp)
+                except OSError:
+                    pass
+
+        async def download_bytes(remote_path: str) -> bytes:
+            fd, local_tmp = tempfile.mkstemp(prefix="vanillux2_download_")
+            os.close(fd)
+            try:
+                await environment.download_file(remote_path, local_tmp)
+                return Path(local_tmp).read_bytes()
+            except Exception as exc:
+                raise FileNotFoundError(f"{remote_path}: {exc}") from exc
+            finally:
+                try:
+                    os.unlink(local_tmp)
+                except OSError:
+                    pass
+
+        ops = ContainerOps(exec_fn=exec_fn, upload_bytes=upload_bytes, download_bytes=download_bytes)
 
         spilled_indices: set[int] = set()
         compaction_stats = context_management.CompactionStats()
@@ -199,7 +234,7 @@ class Vanillux2Agent(BaseAgent):
                     messages,
                     config=self._compaction_config,
                     model=model,
-                    exec_fn=exec_fn,
+                    ops=ops,
                     spilled_indices=spilled_indices,
                     stats=compaction_stats,
                     logger=logger,
@@ -259,7 +294,7 @@ class Vanillux2Agent(BaseAgent):
                         }
                     )
                 else:
-                    tool_content = await edit_tools.dispatch(action["name"], action["args"], exec_fn)
+                    tool_content = await edit_tools.dispatch(action["name"], action["args"], ops)
                     exec_time = time.monotonic() - t1
                     timing_log.append(
                         {
@@ -370,13 +405,17 @@ class Vanillux2Agent(BaseAgent):
         for key in usage_totals:
             usage_totals[key] += getattr(usage, key, 0) or 0
 
-    @staticmethod
     def _append_format_error(
-        messages: list[dict[str, Any]], tool_call_id: str | None
+        self, messages: list[dict[str, Any]], tool_call_id: str | None
     ) -> None:
-        content = _format_error_message(
-            "Your last response did not include a valid `bash` tool call."
-        )
+        if self.enable_edit_tools:
+            content = _format_error_message_multi_tool(
+                "Your last response did not include a valid tool call."
+            )
+        else:
+            content = _format_error_message(
+                "Your last response did not include a valid `bash` tool call."
+            )
         if tool_call_id:
             messages.append(
                 {

@@ -3,18 +3,22 @@
 Registered alongside ``bash`` so the model has a small-write path that never
 puts a whole file's text back into the conversation. These execute host-side
 (matching Vanillux2Agent's architecture): file content is fetched and mutated
-in Python, then written back atomically via the same ``exec_fn`` the agent
-uses for bash (so cwd/env state stays consistent — see ``_wrap_command`` in
-agent.py). No file content ever needs to be capable of round-tripping through
-the model — that's the whole point.
+in Python, then written back atomically.
 
-Note: the model (tmax-9b) was SFT/RL-trained exclusively on the single-tool
-bash harness, and the vendored system prompt says "calling a tool other than
-bash... will cause your response to be rejected." We do not change that
-prompt text (out of scope — no model/prompt changes). These tools are
-therefore mostly future-facing / defense-in-depth: nothing here stops the
-model from using them if it does, but there's no expectation it spontaneously
-will without a training update that teaches it to.
+Regression fix (see docs/vanillux2_context_management.md): file content is
+never embedded into a bash command string here. ``environment.exec()``
+ultimately invokes ``docker compose exec ... bash -c "<command>"`` via
+``asyncio.create_subprocess_exec`` (confirmed against harbor==0.6.6) — the
+*entire* command string is one argv element, so embedding a large or
+binary-containing heredoc body there either exceeds the kernel's ARG_MAX
+(``OSError: Argument list too long``) or raises ``ValueError: embedded null
+byte`` the moment the content contains a literal NUL. Both crashed real runs.
+Content now moves via ``ContainerOps.upload_bytes``/``download_bytes``
+(``docker cp``, not argv), with only tiny fixed-size commands (an atomic
+``mv``, or a `dirname`/`pwd`-based lookup for cwd-relative path resolution)
+still going through ``exec_fn``. This also gives true byte-level fidelity on
+reads — no more harbor's lossy ``errors="replace"`` str decode — enabling
+honest binary-file detection instead of a crash.
 """
 
 from __future__ import annotations
@@ -23,11 +27,11 @@ import difflib
 import json
 import re
 import shlex
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from rl_data.generator.sample_solutions import SUBMIT_MARKER
 
-ExecFn = Callable[[str], Awaitable[Any]]
+from Vanillux2Agent.container_ops import ContainerOps
 
 EDIT_TOOL_NAMES = {"str_replace", "insert", "create", "apply_edits"}
 ALL_TOOL_NAMES = EDIT_TOOL_NAMES | {"bash", "read"}
@@ -40,7 +44,8 @@ EDIT_TOOL_SCHEMAS = [
             "description": (
                 "Read a line-numbered range of a file on disk (also works on "
                 "spill files referenced by truncated tool output). Output is "
-                "capped; read large files in windows."
+                "capped; read large files in windows. Binary files return a "
+                "safe summary instead of raw content."
             ),
             "parameters": {
                 "type": "object",
@@ -60,7 +65,7 @@ EDIT_TOOL_SCHEMAS = [
             "description": (
                 "Replace exactly one occurrence of old_string with new_string in "
                 "path. Whitespace-tolerant match. Fails (no write) if old_string "
-                "matches zero or more than one location."
+                "matches zero or more than one location, or if the file is binary."
             ),
             "parameters": {
                 "type": "object",
@@ -213,34 +218,104 @@ def _nearest_lines_hint(content: str, old_string: str, context: int = 3) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Disk I/O helpers (all via exec_fn, so cwd/env stays consistent with bash)
+# Binary detection
 # ---------------------------------------------------------------------------
 
 
-async def _read_file(exec_fn: ExecFn, path: str) -> str:
-    result = await exec_fn(f"cat -- {shlex.quote(path)}")
-    if result.return_code != 0:
-        raise FileNotFoundError(f"{path}: {(result.stderr or result.stdout or '').strip() or 'not found'}")
-    return result.stdout or ""
+class BinaryFileError(Exception):
+    """Raised when a text-editing tool is pointed at a file that isn't text."""
 
-
-async def _write_file_atomic(exec_fn: ExecFn, path: str, content: str) -> None:
-    tmp = f"{path}.vanillux2_tmp"
-    if not content:
-        script = f": > {shlex.quote(tmp)} && mv -f -- {shlex.quote(tmp)} {shlex.quote(path)}"
-    else:
-        delim = "VANILLUX2_EDIT_EOF"
-        body = content if content.endswith("\n") else content + "\n"
-        while re.search(rf"(?m)^{re.escape(delim)}$", body):
-            delim += "_X"
-        script = (
-            f"cat > {shlex.quote(tmp)} << '{delim}'\n"
-            f"{body}{delim}\n"
-            f"mv -f -- {shlex.quote(tmp)} {shlex.quote(path)}"
+    def __init__(self, path: str, size: int):
+        super().__init__(
+            f"{path} appears to be binary ({size} bytes) — not editable as text; use bash to inspect/modify it"
         )
-    result = await exec_fn(script)
+        self.path = path
+        self.size = size
+
+
+def _looks_binary(data: bytes, sample_size: int = 8192) -> bool:
+    sample = data[:sample_size]
+    if b"\x00" in sample:
+        return True
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _binary_summary(path: str, data: bytes, preview_bytes: int = 256) -> str:
+    preview = data[:preview_bytes]
+    hex_preview = preview.hex(" ", 2)
+    more = "" if len(data) <= preview_bytes else f" (showing first {len(preview)} bytes)"
+    return f"(binary file, {len(data)} bytes{more})\n{hex_preview}"
+
+
+# ---------------------------------------------------------------------------
+# Disk I/O helpers — content moves via upload_bytes/download_bytes (docker
+# cp), never via exec_fn's command argv. Only tiny, fixed-size commands
+# (path resolution, atomic rename) go through exec_fn.
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_path(ops: ContainerOps, path: str) -> str:
+    """Resolve *path* to an absolute path, honoring the persistent pseudo-cwd.
+
+    upload_bytes/download_bytes go straight to the container via `docker cp`,
+    bypassing the `cd "$(cat .../cwd)"` wrapper _wrap_command applies to
+    ordinary bash calls — so a cwd-relative path here would otherwise resolve
+    against the container's default workdir instead of wherever the model's
+    last `cd` left it. Routing through exec_fn picks up that same wrapper.
+
+    Uses only POSIX `dirname`/`basename`/`cd`/`pwd` — deliberately not GNU
+    coreutils' `realpath -m`, which many minimal terminal-bench task images
+    don't ship. Only the parent directory needs to exist (true for edits to
+    existing files, and for `create` targeting a new file in an existing
+    directory); if it doesn't, the path is returned unresolved and the
+    subsequent upload/download call fails naturally.
+    """
+    script = (
+        f"_p={shlex.quote(path)}; "
+        '_dir=$(dirname -- "$_p"); _base=$(basename -- "$_p"); '
+        'if [ -d "$_dir" ]; then printf \'%s/%s\\n\' "$(cd "$_dir" && pwd)" "$_base"; '
+        'else printf \'%s\\n\' "$_p"; fi'
+    )
+    result = await ops.exec_fn(script)
+    resolved = (result.stdout or "").strip()
+    if result.return_code != 0 or not resolved:
+        raise FileNotFoundError(f"{path}: could not resolve path")
+    return resolved
+
+
+async def _read_file_bytes(ops: ContainerOps, path: str) -> bytes:
+    resolved = await _resolve_path(ops, path)
+    try:
+        return await ops.download_bytes(resolved)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        raise FileNotFoundError(f"{path}: {exc}") from exc
+
+
+async def _read_text_file(ops: ContainerOps, path: str) -> str:
+    """Fetch a file's content as text, raising BinaryFileError if it isn't."""
+    data = await _read_file_bytes(ops, path)
+    if _looks_binary(data):
+        raise BinaryFileError(path, len(data))
+    return data.decode("utf-8", errors="replace")
+
+
+async def _write_file_atomic(ops: ContainerOps, path: str, content: str) -> None:
+    resolved = await _resolve_path(ops, path)
+    data = content.encode("utf-8")
+    tmp = f"{resolved}.vanillux2_tmp"
+    try:
+        await ops.upload_bytes(data, tmp)
+    except Exception as exc:
+        raise OSError(f"failed to write {path}: {exc}") from exc
+    result = await ops.exec_fn(f"mv -f -- {shlex.quote(tmp)} {shlex.quote(resolved)}")
     if result.return_code != 0:
-        await exec_fn(f"rm -f -- {shlex.quote(tmp)}")
+        await ops.exec_fn(f"rm -f -- {shlex.quote(tmp)}")
         raise OSError(f"failed to write {path}: {(result.stderr or result.stdout or '').strip()}")
 
 
@@ -250,12 +325,15 @@ async def _write_file_atomic(exec_fn: ExecFn, path: str, content: str) -> None:
 
 
 async def read_file_range(
-    exec_fn: ExecFn, path: str, start: int | None, end: int | None, max_lines: int = 200
+    ops: ContainerOps, path: str, start: int | None, end: int | None, max_lines: int = 200
 ) -> str:
-    wc = await exec_fn(f"wc -l -- {shlex.quote(path)}")
-    if wc.return_code != 0:
-        raise FileNotFoundError(f"{path}: {(wc.stderr or wc.stdout or '').strip() or 'not found'}")
-    total_lines = int((wc.stdout or "0").split()[0] or 0)
+    data = await _read_file_bytes(ops, path)
+    if _looks_binary(data):
+        return _binary_summary(path, data)
+
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    total_lines = len(lines)
     if total_lines == 0:
         return "(file is empty)"
 
@@ -266,15 +344,18 @@ async def read_file_range(
     if start > total_lines or start > end:
         return f"(file has {total_lines} lines; requested range [{start}, {end}] is out of bounds)"
 
-    result = await exec_fn(f"sed -n '{start},{end}p' -- {shlex.quote(path)} | nl -ba -v{start} -w6 -s $'\\t'")
-    body = (result.stdout or "").rstrip("\n")
+    numbered = "\n".join(f"{i:6d}\t{lines[i - 1]}" for i in range(start, end + 1))
     remaining = total_lines - end
     suffix = "" if remaining <= 0 else f"\n... ({remaining} more lines; pass start={end + 1} to continue)"
-    return f"{body}{suffix}"
+    return f"{numbered}{suffix}"
 
 
-async def str_replace(exec_fn: ExecFn, path: str, old_string: str, new_string: str) -> str:
-    content = await _read_file(exec_fn, path)
+async def str_replace(ops: ContainerOps, path: str, old_string: str, new_string: str) -> str:
+    try:
+        content = await _read_text_file(ops, path)
+    except BinaryFileError as exc:
+        return f"str_replace {path}: {exc}"
+
     matches = list(_build_fuzzy_regex(old_string).finditer(content))
 
     if len(matches) == 0:
@@ -292,34 +373,42 @@ async def str_replace(exec_fn: ExecFn, path: str, old_string: str, new_string: s
     added = new_string.count("\n") + 1
     line_no = content[: m.start()].count("\n") + 1
     new_content = content[: m.start()] + new_string + content[m.end() :]
-    await _write_file_atomic(exec_fn, path, new_content)
+    await _write_file_atomic(ops, path, new_content)
     return f"str_replace {path}: -{removed}/+{added} lines @L{line_no} (exit_code=0)"
 
 
-async def insert(exec_fn: ExecFn, path: str, line: int, text: str) -> str:
-    content = await _read_file(exec_fn, path)
+async def insert(ops: ContainerOps, path: str, line: int, text: str) -> str:
+    try:
+        content = await _read_text_file(ops, path)
+    except BinaryFileError as exc:
+        return f"insert {path}: {exc}"
+
     lines = content.splitlines(keepends=True)
     if line < 0 or line > len(lines):
         return f"insert {path}: line {line} out of range (file has {len(lines)} lines)"
 
     insert_text = text if text.endswith("\n") else text + "\n"
     new_content = "".join(lines[:line] + [insert_text] + lines[line:])
-    await _write_file_atomic(exec_fn, path, new_content)
+    await _write_file_atomic(ops, path, new_content)
     added = insert_text.count("\n")
     return f"insert {path}: +{added} lines @L{line} (exit_code=0)"
 
 
-async def create(exec_fn: ExecFn, path: str, content: str) -> str:
-    await _write_file_atomic(exec_fn, path, content)
+async def create(ops: ContainerOps, path: str, content: str) -> str:
+    await _write_file_atomic(ops, path, content)
     lines = len(content.splitlines()) if content else 0
     return f"create {path}: {lines} lines (exit_code=0)"
 
 
-async def apply_edits(exec_fn: ExecFn, path: str, edits: list[dict]) -> str:
+async def apply_edits(ops: ContainerOps, path: str, edits: list[dict]) -> str:
     if not edits:
         return f"apply_edits {path}: no edits given"
 
-    working = await _read_file(exec_fn, path)
+    try:
+        working = await _read_text_file(ops, path)
+    except BinaryFileError as exc:
+        return f"apply_edits {path}: {exc}"
+
     for i, edit in enumerate(edits):
         old_string = edit.get("old_string", "")
         new_string = edit.get("new_string", "")
@@ -337,23 +426,23 @@ async def apply_edits(exec_fn: ExecFn, path: str, edits: list[dict]) -> str:
         m = matches[0]
         working = working[: m.start()] + new_string + working[m.end() :]
 
-    await _write_file_atomic(exec_fn, path, working)
+    await _write_file_atomic(ops, path, working)
     return f"apply_edits {path}: {len(edits)} edits applied (exit_code=0)"
 
 
-async def dispatch(name: str, args: dict, exec_fn: ExecFn) -> str:
+async def dispatch(name: str, args: dict, ops: ContainerOps) -> str:
     """Route a Feature-3 tool call; never raises — always returns model-facing text."""
     try:
         if name == "read":
-            return await read_file_range(exec_fn, args["path"], args.get("start"), args.get("end"))
+            return await read_file_range(ops, args["path"], args.get("start"), args.get("end"))
         if name == "str_replace":
-            return await str_replace(exec_fn, args["path"], args["old_string"], args["new_string"])
+            return await str_replace(ops, args["path"], args["old_string"], args["new_string"])
         if name == "insert":
-            return await insert(exec_fn, args["path"], int(args["line"]), args["text"])
+            return await insert(ops, args["path"], int(args["line"]), args["text"])
         if name == "create":
-            return await create(exec_fn, args["path"], args.get("content", ""))
+            return await create(ops, args["path"], args.get("content", ""))
         if name == "apply_edits":
-            return await apply_edits(exec_fn, args["path"], args.get("edits", []))
+            return await apply_edits(ops, args["path"], args.get("edits", []))
         return f"error: unknown tool '{name}'"
     except KeyError as exc:
         return f"error: missing required argument {exc}"

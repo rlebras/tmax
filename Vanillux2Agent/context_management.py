@@ -37,17 +37,15 @@ not affect what the rebuild produces.
 
 from __future__ import annotations
 
-import difflib
 import json
 import logging
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
 
 import litellm
 
-ExecFn = Callable[[str], Awaitable[Any]]
+from Vanillux2Agent.container_ops import ContainerOps
 
 EDIT_TOOL_NAMES = {"str_replace", "insert", "create", "apply_edits"}
 
@@ -291,21 +289,22 @@ def _spill_path(config: CompactionConfig, raw_index: int) -> str:
     return f"{config.spill_dir.rstrip('/')}/turn_{raw_index:05d}.txt"
 
 
-async def _write_spill(exec_fn: ExecFn, path: str, content: str) -> bool:
+async def _write_spill(ops: ContainerOps, path: str, content: str) -> bool:
+    # Content moves via upload_bytes (docker cp), never through exec_fn's
+    # command argv — a truncated tool output can be large or genuinely
+    # binary (e.g. a command that dumped raw bytes to stdout), and embedding
+    # either into a heredoc command string risks ARG_MAX or "embedded null
+    # byte" (see edit_tools.py's module docstring for the full mechanism).
+    # Only the tiny, fixed-size `mkdir -p` still goes through exec_fn.
     directory = path.rsplit("/", 1)[0]
-    delim = "VANILLUX2_SPILL_EOF"
-    body = content if content.endswith("\n") else content + "\n"
-    # Guard against `content` coincidentally containing a line equal to the
-    # delimiter, which would truncate the heredoc early.
-    while re.search(rf"(?m)^{re.escape(delim)}$", body):
-        delim += "_X"
-    script = (
-        f"mkdir -p {shlex.quote(directory)} && "
-        f"cat > {shlex.quote(path)} << '{delim}'\n"
-        f"{body}{delim}"
-    )
-    result = await exec_fn(script)
-    return result.return_code == 0
+    mkdir_result = await ops.exec_fn(f"mkdir -p {shlex.quote(directory)}")
+    if mkdir_result.return_code != 0:
+        return False
+    try:
+        await ops.upload_bytes(content.encode("utf-8"), path)
+    except Exception:
+        return False
+    return True
 
 
 async def _maybe_truncate_tool_message(
@@ -313,7 +312,7 @@ async def _maybe_truncate_tool_message(
     idx: int,
     config: CompactionConfig,
     model: str | None,
-    exec_fn: ExecFn,
+    ops: ContainerOps,
     spilled_indices: set[int],
     logger: logging.Logger | None,
 ) -> tuple[dict, bool]:
@@ -335,7 +334,7 @@ async def _maybe_truncate_tool_message(
 
     spill_path = _spill_path(config, idx)
     if idx not in spilled_indices:
-        ok = await _write_spill(exec_fn, spill_path, body)
+        ok = await _write_spill(ops, spill_path, body)
         if not ok:
             if logger:
                 logger.warning("context_management: spill write failed for %s; keeping full output", spill_path)
@@ -361,12 +360,65 @@ async def _maybe_truncate_tool_message(
 # ---------------------------------------------------------------------------
 
 
+def _ensure_json_safe(msg: dict, logger: logging.Logger | None) -> dict:
+    """Guarantee *msg* round-trips through json.loads/json.dumps before it's
+    ever sent back to the API.
+
+    Compaction itself only ever parses tool-call arguments and re-serializes
+    via json.dumps (see _stub_tool_call) — it never regex/substring-edits a
+    serialized string. But a message can arrive in the raw log already
+    malformed (e.g. a truncated/malformed tool-call from an upstream
+    parser), and nothing previously validated that before re-sending it on a
+    later turn. This is a defense-in-depth guard, not a fix targeted at one
+    specific origin: any tool_calls[].function.arguments that doesn't parse
+    gets replaced with a minimal valid stub, preserving the same
+    tool_call_id so pairing with the following tool-response message stays
+    intact; any message that still doesn't serialize as a whole has its
+    content dropped rather than being shipped broken.
+    """
+    tool_calls = msg.get("tool_calls")
+    if tool_calls:
+        fixed_calls = []
+        changed = False
+        for tc in tool_calls:
+            func = tc.get("function") or {}
+            args_raw = func.get("arguments")
+            ok = True
+            try:
+                json.loads(args_raw) if isinstance(args_raw, str) else json.dumps(args_raw)
+            except (TypeError, ValueError):
+                ok = False
+            if ok:
+                fixed_calls.append(tc)
+                continue
+            changed = True
+            if logger:
+                logger.warning(
+                    "context_management: repairing malformed tool_call arguments (id=%s)", tc.get("id")
+                )
+            new_func = dict(func)
+            new_func["arguments"] = json.dumps({"error": "malformed arguments; dropped during history rebuild"})
+            fixed_calls.append({**tc, "function": new_func})
+        if changed:
+            msg = {**msg, "tool_calls": fixed_calls}
+
+    try:
+        json.dumps(msg)
+        return msg
+    except (TypeError, ValueError):
+        if logger:
+            logger.warning("context_management: message not JSON-serializable; dropping content")
+        safe = dict(msg)
+        safe["content"] = "[content dropped: not JSON-serializable]"
+        return safe
+
+
 async def build_model_messages(
     raw_messages: list[dict],
     *,
     config: CompactionConfig,
     model: str | None,
-    exec_fn: ExecFn,
+    ops: ContainerOps,
     spilled_indices: set[int],
     stats: CompactionStats,
     logger: logging.Logger | None = None,
@@ -400,9 +452,9 @@ async def build_model_messages(
             )
         elif role == "tool":
             msg, did_truncate = await _maybe_truncate_tool_message(
-                msg, idx, config, model, exec_fn, spilled_indices, logger
+                msg, idx, config, model, ops, spilled_indices, logger
             )
             if did_truncate:
                 stats.truncated_outputs += 1
-        out.append(msg)
+        out.append(_ensure_json_safe(msg, logger))
     return out
