@@ -12,6 +12,12 @@ compacted rebuild of it, produced fresh every step by
 the stubbing/truncation rules, and ``edit_tools.py`` for the optional
 str_replace/insert/create/apply_edits/read tools. Config flags for all of
 this are documented on ``Vanillux2Agent.__init__``.
+
+Self-test gate: ``declare_criteria``/``run_check`` (``self_test.py``) let the
+model declare acceptance criteria and verify them against an isolated copy of
+its declared deliverables before the ``COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT``
+sentinel is honored. See ``self_test.py``'s module docstring for the full
+mechanism and its documented isolation-scope limitation.
 """
 
 from __future__ import annotations
@@ -21,6 +27,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import tempfile
 import time
 from pathlib import Path
@@ -37,11 +44,14 @@ from rl_data.generator.vanillux_solver import (
     _format_error_message_multi_tool,
     _render_instance,
     _render_instance_multi_tool,
+    _SELF_TEST_FORMAT_ERROR_ADDENDUM,
+    _SELF_TEST_INSTANCE_ADDENDUM,
+    _SELF_TEST_SYSTEM_ADDENDUM,
     _SYSTEM_TEMPLATE,
     _SYSTEM_TEMPLATE_MULTI_TOOL,
 )
 
-from Vanillux2Agent import context_management, edit_tools
+from Vanillux2Agent import context_management, edit_tools, self_test
 from Vanillux2Agent.container_ops import ContainerOps
 
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
@@ -106,6 +116,10 @@ class Vanillux2Agent(BaseAgent):
         max_tool_output_tokens: int = 2000,
         head_lines: int = 40,
         tail_lines: int = 40,
+        enable_self_test_gate: bool = True,
+        min_criteria: int = 2,
+        max_gate_rejections: int = 3,
+        self_test_isolation_mode: str = "tempdir",
         **kwargs: Any,
     ) -> None:
         """
@@ -123,6 +137,21 @@ class Vanillux2Agent(BaseAgent):
             (Feature 2).
         head_lines / tail_lines: how much of a truncated tool output to keep
             verbatim at each end.
+
+        Self-test gate flags (see self_test.py for the mechanism these drive):
+
+        enable_self_test_gate: register declare_criteria/run_check and gate
+            the COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT sentinel on them.
+        min_criteria: minimum number of declared criteria that must have a
+            passing isolated check before submit is allowed.
+        max_gate_rejections: after this many rejected submit attempts, submit
+            is allowed anyway (bounds the downside of a model stuck failing
+            its own checks) and ``submitted_with_failing_checks`` is recorded
+            in ``context.metadata``.
+        self_test_isolation_mode: only "tempdir" (fresh temp dir + fresh
+            process, populated with only the declared deliverables) is
+            currently implemented; see self_test.py's module docstring for
+            why a fresh container isn't available at this layer.
         """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
@@ -144,7 +173,18 @@ class Vanillux2Agent(BaseAgent):
             head_lines=head_lines,
             tail_lines=tail_lines,
         )
-        self._tool_schemas = TOOL_SCHEMAS + (edit_tools.EDIT_TOOL_SCHEMAS if enable_edit_tools else [])
+        self.enable_self_test_gate = enable_self_test_gate
+        if self_test_isolation_mode != "tempdir":
+            raise ValueError(f"unsupported self_test_isolation_mode: {self_test_isolation_mode!r}")
+        self._self_test_config = self_test.SelfTestConfig(
+            min_criteria=min_criteria,
+            max_gate_rejections=max_gate_rejections,
+        )
+        self._tool_schemas = (
+            TOOL_SCHEMAS
+            + (edit_tools.EDIT_TOOL_SCHEMAS if enable_edit_tools else [])
+            + (self_test.SELF_TEST_TOOL_SCHEMAS if enable_self_test_gate else [])
+        )
 
     async def setup(self, environment: BaseEnvironment) -> None:
         if not self.persistent_bash:
@@ -167,12 +207,16 @@ class Vanillux2Agent(BaseAgent):
         model = self.model_name or "anthropic/claude-haiku-4-5"
         system_template = _SYSTEM_TEMPLATE_MULTI_TOOL if self.enable_edit_tools else _SYSTEM_TEMPLATE
         render_instance = _render_instance_multi_tool if self.enable_edit_tools else _render_instance
+        rendered_instance = render_instance(instruction.strip())
+        if self.enable_self_test_gate:
+            system_template = f"{system_template}\n{_SELF_TEST_SYSTEM_ADDENDUM}"
+            rendered_instance = f"{rendered_instance}\n{_SELF_TEST_INSTANCE_ADDENDUM}"
         # The raw event log: append-only, never mutated, dumped verbatim to
         # trajectory.json. The model only ever sees a compacted rebuild of
         # this (see context_management.build_model_messages below).
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_template},
-            {"role": "user", "content": render_instance(instruction.strip())},
+            {"role": "user", "content": rendered_instance},
         ]
 
         timing_log: list[dict[str, Any]] = []
@@ -215,8 +259,19 @@ class Vanillux2Agent(BaseAgent):
 
         ops = ContainerOps(exec_fn=exec_fn, upload_bytes=upload_bytes, download_bytes=download_bytes)
 
+        async def isolated_exec(command: str, cwd: str) -> Any:
+            # Deliberately bypasses _wrap_command: no persistent cwd/env
+            # sourcing, no state-file updates — a genuinely fresh process per
+            # self_test.py's isolation contract (Mechanism 3).
+            return await environment.exec(
+                command=f"cd {shlex.quote(cwd)} && {command}",
+                timeout_sec=self.command_timeout,
+            )
+
         spilled_indices: set[int] = set()
         compaction_stats = context_management.CompactionStats()
+        self_test_state = self_test.SelfTestState()
+        submitted_with_failing_checks = False
 
         try:
             for step in range(self.max_steps):
@@ -255,7 +310,12 @@ class Vanillux2Agent(BaseAgent):
                     pass
 
                 msg = response.choices[0].message.model_dump()
-                action = edit_tools.extract_action(msg)
+                action = edit_tools.extract_action(
+                    msg,
+                    extra_tool_names=self_test.SELF_TEST_TOOL_NAMES
+                    if self.enable_self_test_gate
+                    else frozenset(),
+                )
                 if action["type"] == "no_tool_call":
                     msg.pop("tool_calls", None)
                     msg["content"] = msg.get("content") or ""
@@ -293,6 +353,25 @@ class Vanillux2Agent(BaseAgent):
                             "cmd": command[:200],
                         }
                     )
+                elif self.enable_self_test_gate and action["name"] in self_test.SELF_TEST_TOOL_NAMES:
+                    tool_content = await self_test.dispatch(
+                        action["name"],
+                        action["args"],
+                        self_test_state,
+                        ops,
+                        isolated_exec,
+                        self._self_test_config,
+                        step + 1,
+                    )
+                    exec_time = time.monotonic() - t1
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "tool_s": round(exec_time, 1),
+                            "tool": action["name"],
+                        }
+                    )
                 else:
                     tool_content = await edit_tools.dispatch(action["name"], action["args"], ops)
                     exec_time = time.monotonic() - t1
@@ -313,7 +392,16 @@ class Vanillux2Agent(BaseAgent):
                     }
                 )
 
-                if action["type"] == "done" or SUBMIT_MARKER in tool_content:
+                finished = action["type"] == "done" or SUBMIT_MARKER in tool_content
+                if finished and self.enable_self_test_gate:
+                    gate = self_test.evaluate_gate(self_test_state, self._self_test_config)
+                    if not gate.allowed:
+                        self_test_state.gate_rejections += 1
+                        messages.append({"role": "user", "content": self_test.gate_nudge(gate)})
+                        finished = False
+                    elif gate.forced:
+                        submitted_with_failing_checks = True
+                if finished:
                     break
         finally:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -337,11 +425,45 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            checks_run = sum(len(records) for records in self_test_state.checks.values())
+            (self.logs_dir / "self_test.json").write_text(
+                json.dumps(
+                    {
+                        "enabled": self.enable_self_test_gate,
+                        "criteria": {cid: c.description for cid, c in self_test_state.criteria.items()},
+                        "deliverables": self_test_state.deliverables,
+                        "coverage": self_test.coverage(self_test_state),
+                        "gate_rejections": self_test_state.gate_rejections,
+                        "submitted_with_failing_checks": submitted_with_failing_checks,
+                        "checks": {
+                            cid: [
+                                {
+                                    "step": r.step,
+                                    "session_pass": r.session_pass,
+                                    "isolated_pass": r.isolated_pass,
+                                    "circular": r.circular,
+                                }
+                                for r in records
+                            ]
+                            for cid, records in self_test_state.checks.items()
+                        },
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
             context.metadata = {
                 "compaction": {
                     "stubbed_writes": compaction_stats.stubbed_writes,
                     "truncated_outputs": compaction_stats.truncated_outputs,
-                }
+                },
+                "self_test": {
+                    "enabled": self.enable_self_test_gate,
+                    "criteria_declared": len(self_test_state.criteria),
+                    "checks_run": checks_run,
+                    "gate_rejections": self_test_state.gate_rejections,
+                    "submitted_with_failing_checks": submitted_with_failing_checks,
+                },
             }
 
     async def _query_with_retry(
@@ -416,6 +538,8 @@ class Vanillux2Agent(BaseAgent):
             content = _format_error_message(
                 "Your last response did not include a valid `bash` tool call."
             )
+        if self.enable_self_test_gate:
+            content = f"{content}\n{_SELF_TEST_FORMAT_ERROR_ADDENDUM}"
         if tool_call_id:
             messages.append(
                 {

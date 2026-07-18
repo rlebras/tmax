@@ -123,8 +123,9 @@ structured tool-calls** (it reads the `command` argument out of
 - **State:** save/restore persistent shell—each command is wrapped to restore
   `cwd`+`env` from `/tmp/.vanillux2/` before running and re-save after, so
   `cd`/`export` persist across turns without a long-lived shell process.
-- **Termination:** `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` submit marker,
-  `max_steps`, optional cost limit, no-tool-call, or context-window overflow.
+- **Termination:** `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` submit marker
+  (gated — see below), `max_steps`, optional cost limit, no-tool-call, or
+  context-window overflow.
 - **Hardening:** exponential-backoff retry; auth / not-found / context-window /
   unsupported-param / permission errors abort immediately.
 - **Context management:** the raw trajectory (`trajectory.json`) is kept
@@ -137,6 +138,14 @@ structured tool-calls** (it reads the `command` argument out of
   edits never need to put a whole file back into the conversation. See
   [`vanillux2_context_management.md`](vanillux2_context_management.md) for
   the full design, config flags, and measured token savings.
+- **Self-test gate:** the submit marker above is intercepted, not honored
+  outright. `declare_criteria`/`run_check` let the model declare acceptance
+  criteria and verify them against an isolated copy of its declared
+  deliverables; submit is rejected (with a compact nudge, bounded by
+  `max_gate_rejections`) until enough criteria have a passing isolated check.
+  See [`vanillux2_self_test_gate.md`](vanillux2_self_test_gate.md) for the
+  full mechanism, its anti-circularity heuristics, and its isolation-scope
+  limitation.
 
 This is the recommended agent on harbor 0.6.6 when you want the mini-swe-agent
 recipe but a host-side loop you control. See the prior writeup in

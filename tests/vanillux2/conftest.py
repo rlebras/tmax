@@ -91,3 +91,32 @@ def exec_fn(tmp_path):
 @pytest.fixture
 def ops(tmp_path):
     return make_ops(tmp_path)
+
+
+def make_isolated_exec():
+    """Matches self_test.py's ``IsolatedExecFn`` contract: ``(command, cwd) -> ExecResult``,
+    a bare subprocess with no persistent-shell state — unlike ``make_exec_fn``'s cwd, which
+    is fixed once, this one takes cwd per call since self_test.py picks a fresh isolated
+    directory for every check.
+    """
+
+    async def isolated_exec(command: str, cwd: str) -> FakeExecResult:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, stderr_b = await proc.communicate()
+        return FakeExecResult(
+            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stderr=stderr_b.decode("utf-8", errors="replace"),
+            return_code=proc.returncode or 0,
+        )
+
+    return isolated_exec
+
+
+@pytest.fixture
+def isolated_exec_fn():
+    return make_isolated_exec()

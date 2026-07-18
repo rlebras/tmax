@@ -34,3 +34,4 @@ nav:
   - Running evals: running_evals.md
   - Agent harnesses: agent_harnesses.md
   - Vanillux2 context management: vanillux2_context_management.md
+  - Vanillux2 self-test gate: vanillux2_self_test_gate.md

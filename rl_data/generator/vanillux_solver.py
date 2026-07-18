@@ -98,6 +98,13 @@ _SYSTEM_TEMPLATE_MULTI_TOOL: str = _VANILLUX_PROMPTS["system_template_multi_tool
 _INSTANCE_TEMPLATE_MULTI_TOOL: str = _VANILLUX_PROMPTS["instance_template_multi_tool"]
 _FORMAT_ERROR_TEMPLATE_MULTI_TOOL: str = _VANILLUX_PROMPTS["format_error_template_multi_tool"]
 
+# Self-test gate addenda (Vanillux2Agent with enable_self_test_gate=True only
+# — see the comment above these keys in vanillux_prompts.yaml). Appended to
+# whichever system/instance template above is selected; never replaces them.
+_SELF_TEST_SYSTEM_ADDENDUM: str = _VANILLUX_PROMPTS["self_test_system_addendum"]
+_SELF_TEST_INSTANCE_ADDENDUM: str = _VANILLUX_PROMPTS["self_test_instance_addendum"]
+_SELF_TEST_FORMAT_ERROR_ADDENDUM: str = _VANILLUX_PROMPTS["self_test_format_error_addendum"]
+
 
 def _render_instance(task: str) -> str:
     """Render the vanillux instance template with the task description.

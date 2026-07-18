@@ -220,3 +220,55 @@ format_error_template_multi_tool: |
   `insert`, `create`, or `read`), preceded by a THOUGHT. If you want to end
   the task, please issue the command `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
   via the `bash` tool, with no other content in the command.
+
+# ---------------------------------------------------------------------------
+# Self-test gate addenda — used only by Vanillux2Agent when
+# enable_self_test_gate is True (see Vanillux2Agent/self_test.py). NEW,
+# additive keys: appended to whichever system/instance template above is
+# selected (bash-only or multi-tool), never replacing them. A failure
+# analysis of 445 runs found most wrong-but-submitted solutions declared
+# success without ever running an independent check against the task's
+# stated criteria — these addenda, plus the submit gate in agent.py, are the
+# harness-side fix.
+self_test_system_addendum: |
+  You also have two tools for verifying your own work before you submit:
+  - `declare_criteria`: declare the testable acceptance criteria for this
+    task (each a `{id, description, how_to_check}` triple), and optionally
+    which file(s) are your deliverable. Call this once, early.
+  - `run_check`: verify one declared criterion by running a command and
+    comparing its output to an expected value. Checks run against an
+    ISOLATED copy of your declared deliverables, not your live scratch
+    state — a check that only passes because of leftover files, a stray
+    helper, or a weakened deliverable will FAIL here even if it looked fine
+    when you ran it yourself.
+
+  Your final submit (`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`) is
+  REJECTED until enough declared criteria have a passing isolated check.
+  Declaring criteria and using `run_check` is how your work gets verified —
+  it is not optional.
+
+self_test_instance_addendum: |
+
+  ## Verifying your own work
+
+  Before you can submit, you must:
+  1. Call `declare_criteria` with the testable acceptance criteria for this
+     task. If the task statement includes example input/output, turn those
+     into criteria first.
+  2. For each criterion, call `run_check(criterion_id, command, expected)`
+     with a command that independently verifies it — not a check that just
+     re-runs your own code and compares it to itself, and not a check with
+     no real assertion. Use a known answer, an invariant, or a second,
+     independent method.
+  3. Fix and re-check anything that fails. `run_check` reports pass/fail
+     plus the first failing line, not full output — use `bash`/`read` to dig
+     further if a check fails.
+
+  Submitting is gated: it will be rejected, with a list of what's missing,
+  until enough criteria have a passing isolated check. After a few rejected
+  attempts you may submit anyway, but a submission with failing checks is
+  recorded as such.
+
+self_test_format_error_addendum: |
+
+  You may also call `declare_criteria` or `run_check` instead of `bash`.
