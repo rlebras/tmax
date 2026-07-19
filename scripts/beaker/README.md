@@ -110,7 +110,7 @@ read).
 | `--cluster CLUSTER` | `ai2/saturn` | |
 | `--budget BUDGET` | `ai2/oe-adapt` | |
 | `--priority PRI` | `high` | |
-| `--workspace WS` | `$BEAKER_WORKSPACE` or `ai2/tmax` | |
+| `--workspace WS` | `$BEAKER_WORKSPACE` or `ai2/oe-agents` | |
 | `--image IMAGE` | `ai2/cuda12.8-dev-ubuntu22.04-torch2.10.0` | Beaker image. |
 | `--repo-url URL` | current `origin` URL | git URL the beaker task clones. |
 | `--repo-ref REF` | current `git rev-parse HEAD` | git ref to check out. **Must be pushed.** |
@@ -126,6 +126,37 @@ read).
   in the yaml. If that SHA isn't on the remote, the beaker task can't clone
   it. The wrapper warns when this is the case — push first, or pass
   `--repo-ref` explicitly.
+
+## Converting RL/SFT checkpoints so vLLM can load them (`convert_qwen35_causallm_to_cg.py`)
+
+open-instruct GRPO/SFT saves Qwen3.5 checkpoints with
+`architectures = ["Qwen3_5ForCausalLM"]` / `model_type = "qwen3_5_text"` (a flat
+text config). **vLLM (0.19.1–0.22.0) does NOT register `Qwen3_5ForCausalLM`** — only
+the multimodal `Qwen3_5ForConditionalGeneration` — so it refuses to serve them:
+
+    Model architectures ['Qwen3_5ForCausalLM'] are not supported for now.
+
+`--language-model-only` does NOT fix this (that flag only skips the image processor
+for models already on the CG arch). You must **convert** the checkpoint to the CG
+layout first. This is lossless for the text weights:
+
+```bash
+uv run python scripts/beaker/convert_qwen35_causallm_to_cg.py \
+  --src  /weka/.../<run>_checkpoints/step_180 \
+  --donor Qwen/Qwen3.5-9B \      # or hamishivi/Qwen3.5-9B; must match src size/dims
+  --out  /weka/.../swerl_qwen35_9b_step180_cg
+```
+
+It grafts the src's text weights (`model.language_model.*` + `lm_head`) onto the
+donor's vision tower + canonical CG config + image/video processor configs. The
+output has `architectures = ["Qwen3_5ForConditionalGeneration"]` and a
+`preprocessor_config.json`, so vLLM loads it directly — **do NOT pass
+`--language-model-only` for a converted `_cg` checkpoint.** Then point
+`launch_eval.sh <out_dir>` at it. Use a `--name`/served-model-name WITHOUT "ada"
+(a path containing `oe-adapt` trips litellm's commercial-API detector).
+
+(The canonical `Qwen/Qwen3.5-*` / `hamishivi/Qwen3.5-*` base repos already ship the
+CG arch + processor, so they need neither conversion nor the flag.)
 
 ## Where to look when something goes wrong
 

@@ -10,6 +10,10 @@ Hugging Face Hub.
 This is the code behind the **Terminal Data Generation** section of the paper.
 We use `gemini-3.1-pro-preview` as the generation model.
 
+> A longer, end-to-end walkthrough (glossary, "which script do I run" cheat
+> sheet, full ordered runbook, gotchas) is rendered in the docs site at
+> [`../docs/rl_data.md`](../docs/rl_data.md).
+
 ## Compositional generation
 
 Instead of an expensive multi-stage validation pipeline, each task is a single

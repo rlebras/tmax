@@ -368,35 +368,55 @@ if [ -x /usr/local/bin/setup_dockerio_mirror ]; then
     /usr/local/bin/setup_dockerio_mirror || log "setup_dockerio_mirror failed (continuing)"
 fi
 if [ -n "${DOCKER_PAT:-}" ]; then
-    log "writing Docker Hub credentials"
-    DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-hamishi740}"
-    python3 - <<PY
-import base64, json, os
-username = "$DOCKERHUB_USERNAME"
-pat = os.environ["DOCKER_PAT"]
-auth = base64.b64encode(f"{username}:{pat}".encode()).decode()
-cfg_dir = os.path.expanduser("~/.docker")
-os.makedirs(cfg_dir, exist_ok=True)
-cfg_path = os.path.join(cfg_dir, "config.json")
-cfg = {}
-if os.path.exists(cfg_path):
-    try:
-        cfg = json.load(open(cfg_path))
-    except Exception:
-        cfg = {}
-cfg.setdefault("auths", {})["https://index.docker.io/v1/"] = {"auth": auth}
-json.dump(cfg, open(cfg_path, "w"), indent=2)
-print(f"wrote {cfg_path}")
-PY
+    # Authenticate to Docker Hub so task-image pulls don't hit the
+    # unauthenticated rate cap. We `docker login` to VERIFY the credentials and
+    # HARD-ABORT on failure — no anonymous fallback — so a wrong username/PAT
+    # fails fast and unambiguously here, rather than silently rate-limiting or
+    # erroring on every image pull mid-run. DOCKERHUB_USERNAME must be the
+    # Docker Hub account that owns the DOCKER_PAT secret.
+    DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-shashankg209}"
+    log "docker login as '$DOCKERHUB_USERNAME'"
+    if printf '%s' "$DOCKER_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin docker.io >/dev/null 2>&1; then
+        log "Docker Hub login OK ($DOCKERHUB_USERNAME)"
+    else
+        log "FATAL: Docker Hub login failed for '$DOCKERHUB_USERNAME'. Check DOCKERHUB_USERNAME and the DOCKER_PAT secret. Aborting."
+        exit 1
+    fi
+    # Harbor pulls task images via the podman socket (DOCKER_HOST=.../podman.sock);
+    # podman reads registry creds from containers/auth.json, NOT ~/.docker/config.json,
+    # so a plain `docker login` leaves the podman service pulling ANONYMOUSLY (which
+    # then hits the shared-IP unauthenticated rate cap under --host-networking, even
+    # with a paid account). Authenticate podman's own store too.
+    if command -v podman >/dev/null 2>&1; then
+        if printf '%s' "$DOCKER_PAT" | podman login -u "$DOCKERHUB_USERNAME" --password-stdin docker.io >/dev/null 2>&1; then
+            log "podman Docker Hub login OK ($DOCKERHUB_USERNAME)"
+        else
+            log "FATAL: podman Docker Hub login failed for '$DOCKERHUB_USERNAME'. Aborting."
+            exit 1
+        fi
+    fi
 else
-    log "DOCKER_PAT not set — Docker Hub pulls will be rate-limited (100/6hr)"
+    log "FATAL: DOCKER_PAT not set; refusing to fall back to anonymous pulls. Provide the DOCKER_PAT secret. Aborting."
+    exit 1
 fi
 
 # --- 5. Start vLLM in the background ----------------------------------------
 : "${VLLM_VERSION:=0.19.1}"
 : "${VLLM_TOOL_CALL_PARSER:=hermes}"
+: "${VLLM_REASONING_PARSER:=}"
 : "${VLLM_PORT:=8008}"
 : "${DP_SIZE:=1}"
+# Under gantry --host-networking, co-located jobs share the host netns, so any
+# FIXED port collides across jobs. Two consequences, both fixed by randomizing:
+#   1. vLLM derives its INTERNAL TP-rendezvous ports from the VLLM_PORT env var
+#      (VLLM_PORT+1, etc.) — a fixed value makes co-located TP>1 jobs collide and
+#      die at startup ("DistNetworkError ... EADDRINUSE"). UNSET it so vLLM picks
+#      random free internal ports.
+#   2. The OpenAI API server port: a fixed 8008 makes a job's harbor reach a
+#      *neighbor's* vLLM (a different served model), so every trial fails with
+#      "model does not exist". Bind the API server to a per-job free high port.
+unset VLLM_PORT
+API_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); p=s.getsockname()[1]; s.close(); print(p)')"
 VLLM_LOG=/tmp/vllm.log
 VLLM_LOG_TAIL_LINES="${VLLM_LOG_TAIL_LINES:-300}"
 # Pin fastapi < 0.137: fastapi 0.137 changed the router internals and breaks
@@ -412,12 +432,18 @@ VLLM_CMD=( uvx --with "fastapi<0.137"
            --enable-auto-tool-choice
            --enable-prefix-caching
            --tool-call-parser "$VLLM_TOOL_CALL_PARSER"
-           --port "$VLLM_PORT"
+           --port "$API_PORT"
            --gpu-memory-utilization 0.85
            --tensor-parallel-size "$TP_SIZE"
            --data-parallel-size "$DP_SIZE" )
 if [ -n "${MAX_MODEL_LEN:-}" ]; then
     VLLM_CMD+=( --max-model-len "$MAX_MODEL_LEN" )
+fi
+# Reasoning models (e.g. Qwen3) emit <think>...</think>; --reasoning-parser
+# splits that into reasoning_content so tool-calls/content parse cleanly. Leave
+# empty for non-reasoning models (e.g. Qwen3.5).
+if [ -n "${VLLM_REASONING_PARSER:-}" ]; then
+    VLLM_CMD+=( --reasoning-parser "$VLLM_REASONING_PARSER" )
 fi
 if [ "${VLLM_LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
     VLLM_CMD+=( --language_model_only )
@@ -434,10 +460,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-log "waiting for vllm on :$VLLM_PORT (up to 30 min)"
-for _ in $(seq 1 360); do
-    if curl -sf "http://localhost:$VLLM_PORT/v1/models" >/dev/null 2>&1; then
-        log "vllm ready"
+# A 200 on /v1/models can precede the engine actually being able to GENERATE
+# (CUDA-graph capture etc.) — the first completion then fails with "model does
+# not exist", fatal for small runs and lost trials for large ones (notably the
+# 9B). So gate readiness on a real /v1/chat/completions succeeding.
+vllm_can_generate() {
+    curl -sf -X POST "http://localhost:$API_PORT/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$SERVED_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+        >/dev/null 2>&1
+}
+# Readiness cap: 5s * VLLM_READY_MAX_ITERS. Default 720 = 60 min (large models
+# like the 27B on TP>1 need >30 min for weight-load + torch.compile before the
+# API server binds). Override with VLLM_READY_MAX_ITERS.
+VLLM_READY_MAX_ITERS="${VLLM_READY_MAX_ITERS:-720}"
+log "waiting for vllm to serve completions on :$API_PORT (up to $((VLLM_READY_MAX_ITERS*5/60)) min)"
+VLLM_READY=0
+for _ in $(seq 1 "$VLLM_READY_MAX_ITERS"); do
+    if vllm_can_generate; then
+        log "vllm ready (completion probe ok)"
+        VLLM_READY=1
         break
     fi
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
@@ -448,7 +490,7 @@ for _ in $(seq 1 360); do
     sleep 5
 done
 
-if ! curl -sf "http://localhost:$VLLM_PORT/v1/models" >/dev/null 2>&1; then
+if [ "$VLLM_READY" -ne 1 ]; then
     log "vllm did not become ready in 30 min — tail of $VLLM_LOG:"
     tail -"$VLLM_LOG_TAIL_LINES" "$VLLM_LOG" || true
     exit 1
@@ -458,13 +500,13 @@ fi
 : "${N_CONCURRENT:=8}"
 : "${N_ATTEMPTS:=1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
-export OPENAI_API_BASE="http://localhost:$VLLM_PORT/v1"
+export OPENAI_API_BASE="http://localhost:$API_PORT/v1"
 # Harbor's SWE-agent adapter copies OPENAI_BASE_URL (litellm convention) —
 # not OPENAI_API_BASE — into the container, and only then does it pass
 # --agent.model.api_base=... to sweagent. Without this, litellm in the
 # container falls back to https://api.openai.com and every trial exits
 # with NotFoundError: Hosted_vllmException on step 1.
-export OPENAI_BASE_URL="http://localhost:$VLLM_PORT/v1"
+export OPENAI_BASE_URL="http://localhost:$API_PORT/v1"
 
 if [ -z "${HOSTED_VLLM_MODEL_INFO:-}" ]; then
     MODEL_INFO_MAX_INPUT_TOKENS="${MAX_MODEL_LEN:-40960}"
@@ -480,16 +522,46 @@ print(json.dumps({
 PY
 )"
 fi
-: "${HARBOR_MODEL_NAME:=hosted_vllm/$SERVED_MODEL_NAME}"
+# AGENT_IMPORT_PATH with a ":" is a module:Class import path; otherwise it's a
+# harbor built-in agent name (e.g. mini-swe-agent, swe-agent, terminus).
+#
+# Litellm provider prefix (MODEL_PROVIDER, overridable via launch_eval.sh
+# --model-provider). Defaults:
+#   * import-path SWE agents (VanilluxAgent): hosted_vllm/ + an api_base kwarg.
+#   * everything else (built-in agents, and the custom litellm BaseAgent
+#     Vanillux2Agent): openai/ — the installed harbor's litellm has no usable
+#     "hosted_vllm" path, and openai/<served-name> + OPENAI_BASE_URL works.
+#   NOTE Vanillux2Agent: launch with --agent Vanillux2Agent:Vanillux2Agent
+#        --model-provider openai --tool-call-parser qwen3_xml (Qwen3.5 emits
+#        <function=..><parameter=..> XML that the hermes parser drops, which
+#        otherwise loops the agent on format errors).
+# Do NOT set MSWEA_API_KEY for built-in agents: harbor's mini-swe-agent forwards
+# only that when present and skips OPENAI_API_KEY, which litellm then reports as
+# "Missing credentials".
+if [[ "$AGENT_IMPORT_PATH" == *:* ]]; then
+    MODEL_PROVIDER="${MODEL_PROVIDER:-hosted_vllm}"
+else
+    MODEL_PROVIDER="${MODEL_PROVIDER:-openai}"
+    unset MSWEA_API_KEY
+fi
+# An explicit HARBOR_MODEL_NAME wins; otherwise derive it from the provider.
+: "${HARBOR_MODEL_NAME:=$MODEL_PROVIDER/$SERVED_MODEL_NAME}"
 
 HARBOR_CMD=( uv run harbor run
-             --dataset "$DATASET"
              --model "$HARBOR_MODEL_NAME"
              --env "${HARBOR_ENV:-docker}"
              --n-concurrent "$N_CONCURRENT"
-             --agent-kwarg "api_base=http://localhost:$VLLM_PORT/v1"
              --job-name "$JOB_NAME"
              -k "$N_ATTEMPTS" )
+# DATASET_PATH (a local dir on a mounted weka fs, harbor --path) overrides the
+# registry --dataset ref. Used for datasets not in harbor 0.6.6's registry
+# (e.g. terminal-bench-2-1, downloaded via a newer harbor). The dir must be
+# under a weka mount the job has (launch_eval mounts oe-adapt-default).
+if [ -n "${DATASET_PATH:-}" ]; then
+    HARBOR_CMD+=( --path "$DATASET_PATH" )
+else
+    HARBOR_CMD+=( --dataset "$DATASET" )
+fi
 if [ -n "${N_TASKS:-}" ]; then
     HARBOR_CMD+=( --n-tasks "$N_TASKS" )
 fi
@@ -539,7 +611,8 @@ if [ -n "${EXTRA_AGENT_ENVS:-}" ]; then
     done <<< "$EXTRA_AGENT_ENVS"
 fi
 if [[ "$AGENT_IMPORT_PATH" == *:* ]]; then
-    HARBOR_CMD+=( --agent-import-path "$AGENT_IMPORT_PATH" )
+    HARBOR_CMD+=( --agent-import-path "$AGENT_IMPORT_PATH"
+                  --agent-kwarg "api_base=http://localhost:$API_PORT/v1" )
 else
     HARBOR_CMD+=( --agent "$AGENT_IMPORT_PATH" )
 fi

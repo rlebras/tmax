@@ -39,9 +39,13 @@ DP_SIZE=""
 VLLM_PORT=8008
 VLLM_VERSION="0.19.1"
 VLLM_TOOL_CALL_PARSER="hermes"
+VLLM_REASONING_PARSER=""
+MIRROR_URL="${MIRROR_URL:-}"
+MODEL_PROVIDER=""
 VLLM_LANGUAGE_MODEL_ONLY=0
 MAX_MODEL_LEN=""
 DATASET="terminal-bench@2.0"
+DATASET_PATH=""
 HARBOR_ENV="docker"
 AGENT_IMPORT_PATH="Vanillux2Agent:Vanillux2Agent"
 N_CONCURRENT=8
@@ -52,7 +56,7 @@ RESULTS_DIR=""
 CLUSTER="ai2/saturn"
 BUDGET=""
 PRIORITY="urgent"
-BEAKER_WORKSPACE="${BEAKER_WORKSPACE:-ai2/tmax}"
+BEAKER_WORKSPACE="${BEAKER_WORKSPACE:-ai2/oe-agents}"
 BEAKER_IMAGE="${BEAKER_IMAGE:-hamishivi/tmax-eval-interactive}"
 BEAKER_DOCKER_IMAGE="${BEAKER_DOCKER_IMAGE:-}"
 REPO_GIT_URL=""
@@ -91,7 +95,16 @@ Options:
   --dp N                 data-parallel-size (default: 1)
   --port PORT            vllm port (default: 8008)
   --vllm-version VER     vLLM package version for uvx (default: 0.19.1)
-  --tool-call-parser P   vLLM tool call parser (default: hermes)
+  --tool-call-parser P   vLLM tool call parser (default: hermes; use qwen3_xml
+                         for Qwen3.5 with tool-calling agents like Vanillux2Agent)
+  --reasoning-parser P   vLLM reasoning parser (default: none; use qwen3 for
+                         Qwen3 so <think> blocks are split out of tool-calls)
+  --mirror-url HOST:PORT docker.io pull-through mirror(s) for podman task-image
+                         pulls (comma-sep; e.g. jupiter-cs-aus-137.reviz.ai2.in:5000).
+                         Avoids Docker Hub rate limits under co-located jobs.
+  --model-provider PROV  litellm provider prefix for --model (default: hosted_vllm
+                         for import-path agents, openai otherwise). Use openai for
+                         Vanillux2Agent.
   --language-model-only  pass --language_model_only to vLLM
   --max-model-len LEN    pass --max-model-len to vllm
   --dataset DS           harbor dataset (default: terminal-bench@2.0; also
@@ -107,7 +120,7 @@ Options:
   --cluster CLUSTER      beaker cluster (default: ai2/saturn)
   --budget BUDGET        beaker budget (default: omitted; uses workspace default)
   --priority PRI         beaker priority (default: urgent)
-  --workspace WS         beaker workspace (default: \$BEAKER_WORKSPACE or ai2/tmax)
+  --workspace WS         beaker workspace (default: \$BEAKER_WORKSPACE or ai2/oe-agents)
   --image IMAGE          beaker image name or ID (clears default --docker-image)
   --docker-image IMAGE   public Docker image (default: $BEAKER_DOCKER_IMAGE)
   --beaker-scripts-dataset DS
@@ -155,9 +168,13 @@ while [ $# -gt 0 ]; do
         --port)            VLLM_PORT="$2"; shift 2 ;;
         --vllm-version)    VLLM_VERSION="$2"; shift 2 ;;
         --tool-call-parser) VLLM_TOOL_CALL_PARSER="$2"; shift 2 ;;
+        --reasoning-parser) VLLM_REASONING_PARSER="$2"; shift 2 ;;
+        --mirror-url)      MIRROR_URL="$2"; shift 2 ;;
+        --model-provider)  MODEL_PROVIDER="$2"; shift 2 ;;
         --language-model-only|--language_model_only) VLLM_LANGUAGE_MODEL_ONLY=1; shift ;;
         --max-model-len)   MAX_MODEL_LEN="$2"; shift 2 ;;
         --dataset)         DATASET="$2"; shift 2 ;;
+        --dataset-path)    DATASET_PATH="$2"; shift 2 ;;
         --harbor-env)      HARBOR_ENV="$2"; shift 2 ;;
         --agent)           AGENT_IMPORT_PATH="$2"; shift 2 ;;
         --n-concurrent)    N_CONCURRENT="$2"; shift 2 ;;
@@ -215,6 +232,7 @@ cat <<EOF
   Harbor model: ${HARBOR_MODEL_NAME:-hosted_vllm/${SERVED_MODEL_NAME}}
   vLLM version: ${VLLM_VERSION}
   Tool parser:  ${VLLM_TOOL_CALL_PARSER}
+  Reason parser: ${VLLM_REASONING_PARSER:-<none>}
   LM only:      ${VLLM_LANGUAGE_MODEL_ONLY}
   GPUs:         ${GPU_COUNT} (TP=${TP_SIZE}, DP=${DP_SIZE})
   Dataset:      ${DATASET}
@@ -255,20 +273,23 @@ GANTRY_CMD=(
     --priority "$PRIORITY"
     --weka "oe-adapt-default:/weka/oe-adapt-default"
     --env-secret HF_TOKEN
-    --env-secret "DOCKER_PAT=${DOCKER_PAT_SECRET:-hamishivi_DOCKER_PAT}"
-    --env-secret "DAYTONA_API_KEY=${DAYTONA_API_KEY_SECRET:-hamishivi_DAYTONA_API_KEY}"
+    --env-secret "DOCKER_PAT=${DOCKER_PAT_SECRET:-shashankg_DOCKER_PAT}"
     --env "MODEL_PATH=${MODEL_PATH}"
     --env "MODEL_REVISION=${REVISION}"
     --env "SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
     --env "HARBOR_MODEL_NAME=${HARBOR_MODEL_NAME}"
     --env "VLLM_VERSION=${VLLM_VERSION}"
     --env "VLLM_TOOL_CALL_PARSER=${VLLM_TOOL_CALL_PARSER}"
+    --env "VLLM_REASONING_PARSER=${VLLM_REASONING_PARSER}"
+    --env "MIRROR_URL=${MIRROR_URL}"
+    --env "MODEL_PROVIDER=${MODEL_PROVIDER}"
     --env "VLLM_LANGUAGE_MODEL_ONLY=${VLLM_LANGUAGE_MODEL_ONLY}"
     --env "VLLM_PORT=${VLLM_PORT}"
     --env "TP_SIZE=${TP_SIZE}"
     --env "DP_SIZE=${DP_SIZE}"
     --env "MAX_MODEL_LEN=${MAX_MODEL_LEN}"
     --env "DATASET=${DATASET}"
+    --env "DATASET_PATH=${DATASET_PATH}"
     --env "HARBOR_ENV=${HARBOR_ENV}"
     --env "AGENT_IMPORT_PATH=${AGENT_IMPORT_PATH}"
     --env "EXTRA_AGENT_KWARGS=${EXTRA_AGENT_KWARGS}"
@@ -295,6 +316,12 @@ GANTRY_CMD=(
     --propagate-failure
     --no-python
 )
+
+# The daytona backend needs an API key; only register the secret then, so the
+# default docker path doesn't require a DAYTONA_API_KEY secret in the workspace.
+if [ "$HARBOR_ENV" = "daytona" ]; then
+    GANTRY_CMD+=(--env-secret "DAYTONA_API_KEY=${DAYTONA_API_KEY_SECRET:-hamishivi_DAYTONA_API_KEY}")
+fi
 
 if [ -n "$BEAKER_IMAGE" ]; then
     GANTRY_CMD+=(--beaker-image "$BEAKER_IMAGE")

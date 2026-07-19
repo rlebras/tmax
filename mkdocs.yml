@@ -1,0 +1,35 @@
+site_name: tmax
+site_description: Terminal-agent RL/SFT — data generation and training docs
+repo_url: https://github.com/shatu/tmax
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - content.code.copy
+    - toc.integrate
+
+# The guides intentionally link to source files outside docs/ (e.g.
+# ../rl_data/generate_tasks.py) so the Markdown is clickable on GitHub / in the
+# IDE. Those targets live outside docs_dir, so tell mkdocs not to flag them.
+validation:
+  links:
+    not_found: ignore
+    anchors: ignore
+    unrecognized_links: ignore
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.details
+  - tables
+
+nav:
+  - Home: index.md
+  - RL data generation: rl_data.md
+  - SFT: sft.md
+  - Running evals: running_evals.md
+  - Agent harnesses: agent_harnesses.md
