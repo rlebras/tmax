@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from rl_data.generator.vanillux_solver import (
     _SYSTEM_TEMPLATE,
     _truncate_observation,
 )
+from Vanillux2Agent import self_test as st
 
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
 
@@ -61,6 +63,46 @@ _DOCKER_EXEC_ERROR_RE = re.compile(
     r".*?: exit status \d+\s*$"
 )
 
+_SELF_TEST_PROMPT_ADDENDUM = """
+## Self-testing (required before submit)
+
+Before you can submit, you must verify your work against the task's own
+acceptance criteria — not just "it looks right":
+
+1. Early on, turn the task's requirements (and any example input/output) into
+   a short list of testable acceptance criteria. Write them as JSON to
+   `{criteria_path}`:
+   ```json
+   {{
+     "criteria": [
+       {{"id": "short_stable_id", "description": "the observable property and its expected outcome", "how_to_check": "how you plan to verify this"}}
+     ],
+     "deliverables": ["path/to/your/solution/file", "..."]
+   }}
+   ```
+   `deliverables` should list the file(s) that make up your solution — only
+   these are copied into the isolated check environment (see below), so
+   scratch files/helpers you rely on won't be present there.
+2. Verify each criterion with: `agent-check <id> -- <command>` (this is a
+   harness convention, not a real binary — the harness intercepts it). The
+   check passes iff `<command>` exits 0, so use a real assertion (`test`,
+   `diff`, `grep -q`, `pytest`, `[[ ... ]]`, etc.) — a command with no
+   assertion, or one that only compares a program's output to itself, does
+   not count. `agent-check` also re-runs `<command>` in an ISOLATED copy of
+   your declared deliverables; only that isolated result counts, so a check
+   that passes only because of leftover files or a weakened deliverable will
+   fail there.
+3. You need at least {min_criteria} declared criteria each with a passing
+   `agent-check` before your submit will be accepted. Submitting early will
+   be rejected with a compact list of what's unmet.
+"""
+
+
+def _self_test_prompt_addendum(config: "st.SelfTestConfig") -> str:
+    return _SELF_TEST_PROMPT_ADDENDUM.format(
+        criteria_path=config.criteria_path, min_criteria=config.min_criteria
+    )
+
 
 class Vanillux2Agent(BaseAgent):
     """Bash-tool Harbor agent with vanillux prompts and direct API calls."""
@@ -86,6 +128,10 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        enable_self_test_gate: bool = False,
+        min_criteria: int = 2,
+        max_gate_rejections: int = 3,
+        self_test_check_timeout: int = 60,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
@@ -99,6 +145,13 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.enable_self_test_gate = enable_self_test_gate
+        self.self_test_config = st.SelfTestConfig(
+            min_criteria=min_criteria,
+            max_gate_rejections=max_gate_rejections,
+            check_timeout_sec=self_test_check_timeout,
+            state_dir=f"{_STATE_DIR}/{st.SELF_TEST_STATE_SUBDIR}",
+        )
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -120,9 +173,12 @@ class Vanillux2Agent(BaseAgent):
         context: AgentContext,
     ) -> None:
         model = self.model_name or "anthropic/claude-haiku-4-5"
+        instance_message = _render_instance(instruction.strip())
+        if self.enable_self_test_gate:
+            instance_message += _self_test_prompt_addendum(self.self_test_config)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": _SYSTEM_TEMPLATE},
-            {"role": "user", "content": _render_instance(instruction.strip())},
+            {"role": "user", "content": instance_message},
         ]
 
         timing_log: list[dict[str, Any]] = []
@@ -133,6 +189,15 @@ class Vanillux2Agent(BaseAgent):
             "reasoning_tokens": 0,
         }
         format_errors = 0
+        self_test_state = st.SelfTestState()
+
+        async def session_exec(command: str) -> Any:
+            return await self._execute_bash(command, environment)
+
+        async def isolated_exec(command: str, cwd: str) -> Any:
+            return await environment.exec(
+                command=command, cwd=cwd, timeout_sec=self.self_test_config.check_timeout_sec
+            )
 
         try:
             for step in range(self.max_steps):
@@ -185,6 +250,50 @@ class Vanillux2Agent(BaseAgent):
                 command = action.get("command") or ""
                 tool_call_id = action.get("tool_call_id") or ""
 
+                check_match = st.parse_agent_check(command) if self.enable_self_test_gate else None
+                if check_match is not None:
+                    criterion_id, inner_command = check_match
+                    t1 = time.monotonic()
+                    tool_content = await self._run_agent_check(
+                        criterion_id, inner_command, self_test_state, session_exec, isolated_exec, step + 1
+                    )
+                    exec_time = time.monotonic() - t1
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tool_call_id, "content": tool_content}
+                    )
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "bash_s": round(exec_time, 1),
+                            "agent_check": criterion_id,
+                        }
+                    )
+                    continue
+
+                if action["type"] == "done" and self.enable_self_test_gate:
+                    criteria, _deliverables = await st.load_criteria(session_exec, self.self_test_config)
+                    gate = st.evaluate_gate(criteria, self_test_state, self.self_test_config)
+                    if not gate.allowed:
+                        self_test_state.gate_rejections += 1
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": st.gate_nudge(gate),
+                            }
+                        )
+                        timing_log.append(
+                            {
+                                "step": step + 1,
+                                "llm_s": round(llm_time, 1),
+                                "gate_rejected": True,
+                            }
+                        )
+                        continue
+                    if gate.forced:
+                        self_test_state.submitted_with_failing_checks = True
+
                 t1 = time.monotonic()
                 result = await self._execute_bash(command, environment)
                 exec_time = time.monotonic() - t1
@@ -232,6 +341,46 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            if self.enable_self_test_gate:
+                (self.logs_dir / "self_test_state.json").write_text(
+                    json.dumps(
+                        {
+                            "checks": {
+                                cid: [asdict(r) for r in records]
+                                for cid, records in self_test_state.checks.items()
+                            },
+                            "gate_rejections": self_test_state.gate_rejections,
+                            "submitted_with_failing_checks": self_test_state.submitted_with_failing_checks,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
+
+    async def _run_agent_check(
+        self,
+        criterion_id: str,
+        command: str,
+        state: "st.SelfTestState",
+        session_exec: Any,
+        isolated_exec: Any,
+        step: int,
+    ) -> str:
+        criteria, deliverables = await st.load_criteria(session_exec, self.self_test_config)
+        cwd_result = await session_exec("pwd")
+        persistent_cwd = (getattr(cwd_result, "stdout", None) or "/").strip() or "/"
+        return await st.run_agent_check(
+            criterion_id,
+            command,
+            criteria=criteria,
+            deliverables=deliverables,
+            state=state,
+            config=self.self_test_config,
+            session_exec=session_exec,
+            isolated_exec=isolated_exec,
+            persistent_cwd=persistent_cwd,
+            step=step,
+        )
 
     async def _query_with_retry(
         self, model: str, messages: list[dict[str, Any]]
