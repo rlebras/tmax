@@ -233,6 +233,78 @@ def test_circularity_flags_real_test_without_echo_fallback_not_flagged_for_that_
     assert not any("exit code is always 0" in f for f in flags)
 
 
+def test_circularity_flags_trailing_true_fallback():
+    flags = st.circularity_flags("grep -q PASS out.txt || true")
+    assert any("masking any real failure" in f for f in flags)
+    flags2 = st.circularity_flags("grep -q PASS out.txt; true")
+    assert any("masking any real failure" in f for f in flags2)
+
+
+def test_circularity_flags_trailing_echo_exit_code():
+    flags = st.circularity_flags('python3 solve.py; echo "$?"')
+    assert any("isn't the same as acting on it" in f for f in flags)
+    flags2 = st.circularity_flags("python3 solve.py; echo $?")
+    assert any("isn't the same as acting on it" in f for f in flags2)
+
+
+def test_circularity_flags_except_pass():
+    flags = st.circularity_flags(
+        "python3 -c \"try:\n    assert 1 == 2\nexcept Exception:\n    pass\""
+    )
+    assert any("silently swallowed" in f for f in flags)
+
+
+def test_circularity_flags_set_plus_e():
+    flags = st.circularity_flags("set +e\ntest -f /app/out.html")
+    assert any("set +e" in f for f in flags)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'python3 -c "if a != b: sys.exit(1)"',
+        'python3 -c "if a != b: raise ValueError(\'nope\')"',
+        'python3 -c "if a != b: os._exit(1)"',
+    ],
+)
+def test_circularity_flags_sys_exit_raise_count_as_real_assertion(command):
+    # a script that ACTS on a comparison via sys.exit/raise/os._exit (rather
+    # than the literal word `assert`) is just as real — must not be flagged.
+    assert st.circularity_flags(command) == []
+
+
+def test_extract_script_reference_python_invocation():
+    assert st.extract_script_reference("python3 /tmp/verify.py") == "/tmp/verify.py"
+    assert st.extract_script_reference("python /app/check_weights.py") == "/app/check_weights.py"
+
+
+def test_extract_script_reference_bare_path():
+    assert st.extract_script_reference("./check.sh") == "./check.sh"
+    assert st.extract_script_reference("cd /app && ./verify.sh") == "./verify.sh"
+
+
+def test_extract_script_reference_none_for_inline_command():
+    assert st.extract_script_reference("test -f /app/out.html") is None
+    assert st.extract_script_reference('python3 -c "assert 1 == 1"') is None
+
+
+def test_classify_check_circular_when_flagged():
+    assert st.classify_check("true", ["some flag"]) == "circular"
+
+
+def test_classify_check_trivial_existence():
+    assert st.classify_check("test -f /app/out.txt", []) == "trivial_existence"
+    assert st.classify_check("ls /app/out.txt", []) == "trivial_existence"
+
+
+def test_classify_check_external_script():
+    assert st.classify_check("python3 /tmp/verify.py", []) == "external_script"
+
+
+def test_classify_check_behavioral():
+    assert st.classify_check('test "$(cat out.txt)" = "42"', []) == "behavioral"
+
+
 def test_weakening_warning_no_history():
     state = st.SelfTestState()
     assert st.weakening_warning("c1", "pytest -q", state) is None
@@ -425,6 +497,61 @@ async def test_run_agent_check_flags_circular(fake_env, session_exec, isolated_e
     )
     assert "circular/trivial" in result
     assert state.checks["c1"][0].circular is True
+    assert state.checks["c1"][0].check_category == "circular"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_check_inspects_external_script_content(fake_env, session_exec, isolated_exec):
+    """A check that delegates to an external script hides whatever
+    circularity lives in that file from a purely-command-text heuristic —
+    run_agent_check must read the file and check its content too."""
+    config = st.SelfTestConfig(state_dir=str(fake_env.root / ".agent" / "self_test"))
+    (fake_env.root / "verify.py").write_text("print(1 == 2)\n")  # toothless: always exits 0
+    state = st.SelfTestState()
+    criteria = {"c1": st.Criterion(id="c1", description="whatever")}
+
+    result = await st.run_agent_check(
+        "c1",
+        "python3 verify.py",
+        criteria=criteria,
+        deliverables=["verify.py"],
+        state=state,
+        config=config,
+        session_exec=session_exec,
+        isolated_exec=isolated_exec,
+        persistent_cwd=str(fake_env.root),
+        step=1,
+    )
+    assert "circular/trivial" in result
+    record = state.checks["c1"][0]
+    assert record.circular is True
+    assert "external script" in record.circular_reason
+    assert record.check_category == "circular"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_check_external_script_clean_content_not_flagged(fake_env, session_exec, isolated_exec):
+    config = st.SelfTestConfig(state_dir=str(fake_env.root / ".agent" / "self_test"))
+    (fake_env.root / "verify.py").write_text("assert 1 == 1\n")
+    state = st.SelfTestState()
+    criteria = {"c1": st.Criterion(id="c1", description="whatever")}
+
+    result = await st.run_agent_check(
+        "c1",
+        "python3 verify.py",
+        criteria=criteria,
+        deliverables=["verify.py"],
+        state=state,
+        config=config,
+        session_exec=session_exec,
+        isolated_exec=isolated_exec,
+        persistent_cwd=str(fake_env.root),
+        step=1,
+    )
+    assert "PASS (isolated)" in result
+    record = state.checks["c1"][0]
+    assert record.circular is False
+    assert record.check_category == "external_script"
 
 
 @pytest.mark.asyncio

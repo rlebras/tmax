@@ -97,6 +97,15 @@ class CheckRecord:
     circular_reason: str | None
     missing_deliverables: list[str]
     step: int
+    # Observability only — never affects pass/fail or gate coverage. Lets a
+    # later A/B analysis (this field exists because deriving these buckets
+    # by re-parsing raw command text after the fact, across three prior
+    # rounds, was slow) see at a glance how substantive the checks in a run
+    # actually were: "circular" (flagged by circularity_flags, incl. an
+    # external script it delegates to), "trivial_existence" (bare `test -f`/
+    # `ls`, nothing behavioral), "external_script" (delegates to a file we
+    # inspected but didn't flag), or "behavioral" (everything else).
+    check_category: str = "behavioral"
 
 
 @dataclass
@@ -287,20 +296,47 @@ async def load_criteria(exec_fn: ExecFn, config: SelfTestConfig) -> tuple[dict[s
 
 _TRIVIAL_COMMAND_RE = re.compile(r"^\s*(true|:|exit\s+0)\s*$")
 # Constructs whose OWN exit status genuinely reflects success/failure. `==`/
-# `!=` deliberately excluded — see _check_bare_comparison below: a bare
-# comparison (e.g. inside `print(...)`, or as an unused expression like
-# `print(x) == y`) doesn't affect the exit code by itself, so treating it as
-# sufficient evidence of "a real assertion" (as an earlier version of this
-# heuristic did) let checks that can never fail regardless of the underlying
-# condition pass a 445-trial A/B undetected.
-_REAL_ASSERTION_HINTS = ("assert", "diff", "grep", "pytest", "unittest", "[[", "[ ", "cmp ", "test ")
+# `!=` deliberately excluded: a bare comparison (e.g. inside `print(...)`, or
+# as an unused expression like `print(x) == y`) doesn't affect the exit code
+# by itself, so treating it as sufficient evidence of "a real assertion" (as
+# an earlier version of this heuristic did) let checks that can never fail
+# regardless of the underlying condition pass a 445-trial A/B undetected.
+# `sys.exit`/`raise`/`os._exit`/bare `exit(` count too — a script that acts
+# on a comparison via one of these (rather than the literal word `assert`)
+# is just as real an assertion; omitting them would flag legitimate
+# `if x != y: sys.exit(1)`-style scripts as circular.
+_REAL_ASSERTION_HINTS = (
+    "assert", "diff", "grep", "pytest", "unittest", "[[", "[ ", "cmp ", "test ",
+    "sys.exit", "os._exit", "raise ", "exit(",
+)
+
+
+def _has_real_assertion(cmd: str) -> bool:
+    return any(h in cmd for h in _REAL_ASSERTION_HINTS)
 _SELF_DIFF_RE = re.compile(r"diff\s+<\((?P<a>.+?)\)\s+<\((?P<b>.+?)\)")
 _SELF_EQ_RE = re.compile(r"\[\[?\s*[\"']?\$\((?P<a>.+?)\)[\"']?\s*(?:==|=)\s*[\"']?\$\((?P<b>.+?)\)[\"']?\s*\]\]?")
-# `cmd && echo PASS || echo FAIL` (or just `cmd || echo ...`) always exits 0
-# — `echo` never fails — regardless of what `cmd` actually did. Seen
-# verbatim in a real trace (`test -f /app/out.html && echo 'PASS' || echo
-# 'FAIL'`) that let a wrong deliverable through the gate undetected.
-_TRAILING_ECHO_FALLBACK_RE = re.compile(r"\|\|\s*echo\b[^|&;]*$")
+# Shell idioms whose tail always exits 0 regardless of what ran before it —
+# each one seen (or a direct variant of one seen) in a real trace that let a
+# wrong deliverable through the gate undetected.
+_ALWAYS_ZERO_TAIL_PATTERNS = (
+    (
+        re.compile(r"\|\|\s*echo\b[^|&;]*$"),
+        "ends in `|| echo ...` (or `cmd && echo PASS || echo FAIL`) — `echo` always "
+        "succeeds, so the check's exit code is always 0 regardless of what came before it",
+    ),
+    (
+        re.compile(r"(?:\|\||;)\s*true\s*$"),
+        "ends in `|| true` / `; true` — `true` always succeeds, masking any real "
+        "failure that happened before it",
+    ),
+    (
+        re.compile(r"echo\s+[\"']?\$\?[\"']?\s*$"),
+        "ends in `echo $?` — printing the exit code isn't the same as acting on it; "
+        "`echo` itself always succeeds regardless of what `$?` held",
+    ),
+)
+_EXCEPT_PASS_RE = re.compile(r"except\b[^:]*:\s*pass\b")
+_SET_PLUS_E_RE = re.compile(r"\bset\s+\+e\b")
 
 
 def circularity_flags(command: str) -> list[str]:
@@ -308,23 +344,36 @@ def circularity_flags(command: str) -> list[str]:
     flags: list[str] = []
     cmd = command or ""
 
-    has_real_assertion = any(h in cmd for h in _REAL_ASSERTION_HINTS)
+    has_real_assertion = _has_real_assertion(cmd)
     if _TRIVIAL_COMMAND_RE.match(cmd):
         flags.append("command is a no-op (`true`/`:`/`exit 0`) with no real assertion")
     elif not has_real_assertion:
         if "==" in cmd or "!=" in cmd:
             flags.append(
-                "uses `==`/`!=` but nothing (assert/test/diff/grep/pytest/...) enforces it — "
-                "a bare comparison (e.g. inside `print(...)`, or as an unused expression) "
-                "doesn't make the process exit non-zero on a mismatch"
+                "uses `==`/`!=` but nothing (assert/test/diff/grep/pytest/sys.exit/.../) "
+                "enforces it — a bare comparison (e.g. inside `print(...)`, or as an unused "
+                "expression) doesn't make the process exit non-zero on a mismatch"
             )
         else:
             flags.append("no recognizable assertion in `command` (no test/diff/grep/assert/pytest/...)")
 
-    if _TRAILING_ECHO_FALLBACK_RE.search(cmd.rstrip()):
+    stripped = cmd.rstrip()
+    for rx, msg in _ALWAYS_ZERO_TAIL_PATTERNS:
+        if rx.search(stripped):
+            flags.append(msg)
+            break
+
+    if _EXCEPT_PASS_RE.search(cmd):
         flags.append(
-            "ends in `|| echo ...` (or `cmd && echo PASS || echo FAIL`) — `echo` always "
-            "succeeds, so the check's exit code is always 0 regardless of what came before it"
+            "catches exceptions with a bare `except: pass` — a real failure is silently "
+            "swallowed instead of propagating as a non-zero exit"
+        )
+
+    if _SET_PLUS_E_RE.search(cmd):
+        flags.append(
+            "uses `set +e`, which disables exit-on-error for the rest of the script — "
+            "make sure the final exit code still reflects the real outcome, not just "
+            "whatever command happened to run last"
         )
 
     for rx in (_SELF_DIFF_RE, _SELF_EQ_RE):
@@ -334,6 +383,42 @@ def circularity_flags(command: str) -> list[str]:
             break
 
     return flags
+
+
+# A check that mostly delegates to an external script file (`python3
+# /tmp/verify.py`, `./check.sh`) hides whatever circularity lives in that
+# file from every heuristic above, which only ever sees the invocation
+# command. Best-effort: extract the referenced path and, if readable, run
+# the same heuristic against its contents too.
+_SCRIPT_REF_RE = re.compile(
+    r"(?:python3?|bash|sh|node|ruby|perl)\s+([^\s;&|]+\.(?:py|sh|js|rb|pl))\b"
+    r"|(?:^|[;&|]\s*)(\.{0,2}/[^\s;&|]+\.(?:py|sh))\b"
+)
+
+
+def extract_script_reference(command: str) -> str | None:
+    """Best-effort: the external script file a check command primarily
+    delegates to, if any (``None`` for inline one-liners)."""
+    m = _SCRIPT_REF_RE.search(command or "")
+    if not m:
+        return None
+    return m.group(1) or m.group(2)
+
+
+_TRIVIAL_EXISTENCE_RE = re.compile(r"^\s*(?:test\s+-[ef]\s+\S+|\[\s+-[ef]\s+\S+\s*\]|ls\s+\S+)\s*$")
+
+
+def classify_check(command: str, flags: list[str]) -> str:
+    """Coarse, observability-only bucket for a check — never affects
+    pass/fail or gate coverage. See ``CheckRecord.check_category``."""
+    cmd = command or ""
+    if flags:
+        return "circular"
+    if _TRIVIAL_EXISTENCE_RE.match(cmd.strip()):
+        return "trivial_existence"
+    if not _has_real_assertion(cmd) and extract_script_reference(cmd):
+        return "external_script"
+    return "behavioral"
 
 
 def weakening_warning(criterion_id: str, command: str, state: SelfTestState) -> str | None:
@@ -458,7 +543,32 @@ async def run_agent_check(
     if not command:
         return f"agent-check {criterion_id}: command is required after `--`"
 
-    flags = circularity_flags(command)
+    # Only worth reading the referenced file when the OUTER command has no
+    # assertion mechanism of its own — otherwise the script is just a data
+    # source for an already-legitimate outer check (e.g. `test "$(python3
+    # solution.py)" = "42"`), and reading it risks flagging perfectly good
+    # checks over unrelated content in a script invoked only for its stdout.
+    script_path = extract_script_reference(command) if not _has_real_assertion(command) else None
+    script_content = ""
+    if script_path:
+        abs_script_path = (
+            script_path if script_path.startswith("/") else f"{persistent_cwd.rstrip('/')}/{script_path}"
+        )
+        script_result = await session_exec(f"cat {shlex.quote(abs_script_path)} 2>/dev/null")
+        script_content = getattr(script_result, "stdout", None) or ""
+
+    if script_content.strip():
+        # The outer command has no assertion of its own (gated above), so
+        # the SCRIPT's own circularity is what actually determines whether
+        # a real assertion backs this check — it supersedes, rather than
+        # adds to, the outer command's "no recognizable assertion" verdict
+        # (which would otherwise fire on every `python3 script.py`-only
+        # invocation regardless of what that script actually does).
+        flags = [
+            f"external script {script_path!r} looks circular: {f}" for f in circularity_flags(script_content)
+        ]
+    else:
+        flags = circularity_flags(command)
     weaken_warning = weakening_warning(criterion_id, command, state)
 
     session_result = await session_exec(command)
@@ -481,6 +591,7 @@ async def run_agent_check(
         circular_reason="; ".join(flags) if flags else None,
         missing_deliverables=missing,
         step=step,
+        check_category=classify_check(command, flags),
     )
     state.checks.setdefault(criterion_id, []).append(record)
     await persist_state(session_exec, config, state)

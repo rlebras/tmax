@@ -78,11 +78,20 @@ Verify your work against the task's own acceptance criteria before submitting:
    `type`/`command -v` first (it will correctly report "not found" — that's
    expected, just run it). It must be on its own LINE (it can share a bash
    call with setup on OTHER lines, but not chained with `&&`/`;` on the SAME
-   line). It passes iff `<command>` EXITS non-zero on failure — so use
-   `assert`/`test`/`diff`/`grep -q`/`pytest`, not a comparison whose result
-   is only printed (`print(a == b)` always exits 0, pass or fail) and not
-   `cmd && echo PASS || echo FAIL` (that always exits 0 too — `echo` never
-   fails). It also re-runs `<command>` against an ISOLATED copy of your
+   line). It passes iff `<command>` EXITS non-zero on failure — nothing else
+   is checked, so a command that can't fail is worthless regardless of what
+   it looks like:
+     BAD:  `python3 -c "print(a == b)"` (prints True/False, always exits 0)
+     BAD:  `cmd && echo PASS || echo FAIL` (`echo` never fails, always exits 0)
+     GOOD: `python3 -c "assert a == b"` — or `test "$a" = "$b"`
+   Use an independent oracle, not a comparison of the program to itself:
+     - known-answer: `test "$(./solve input.txt)" = "42"` (a fixed value,
+       e.g. from the task's own example I/O)
+     - differential: `diff <(./solve.sh) <(python3 reference.py)` (two
+       independently-derived results)
+     - property/invariant: something that must structurally hold (round
+       trip, idempotence) rather than one hard-coded value
+   It also re-runs `<command>` against an ISOLATED copy of your
    deliverables; only that result counts, so leftover files or a weakened
    deliverable won't fake a pass.
 3. Submit needs >= {min_criteria} criteria each with a passing `agent-check`,
