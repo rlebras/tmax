@@ -209,6 +209,94 @@ async def test_agent_check_syntax_is_inert_when_gate_disabled(tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# Robustness fixes: bundled agent-check, malformed syntax, implicit submit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bundled_agent_check_runs_setup_then_check(tmp_path, monkeypatch, fake_env):
+    """agent-check bundled with setup on other lines: the setup still runs
+    (in-session), and the check is still intercepted rather than leaking to
+    the real shell as 'command not found'.
+    """
+    agent = make_agent(tmp_path, monkeypatch, enable_self_test_gate=True, min_criteria=1, max_steps=2)
+    criteria_path = agent.self_test_config.criteria_path
+    declare = (
+        f"mkdir -p {Path(criteria_path).parent} && cat > {criteria_path} <<'EOF'\n"
+        '{"criteria": [{"id": "c1", "description": "prints 42", "how_to_check": "run it"}], '
+        '"deliverables": ["solution.py"]}\n'
+        "EOF"
+    )
+    bundled = "cat > solution.py << 'EOF'\nprint(42)\nEOF\nagent-check c1 -- test \"$(python3 solution.py)\" = \"42\""
+
+    scripted = await run_agent(agent, fake_env, [declare, bundled])
+    assert scripted.calls == 2
+
+    trajectory = json.loads((agent.logs_dir / "trajectory.json").read_text())
+    last_tool_msg = trajectory[-1]["content"]
+    assert "agent-check c1: PASS (isolated)" in last_tool_msg
+    assert "command not found" not in last_tool_msg
+
+    state = read_self_test_state(agent)
+    assert state["checks"]["c1"][0]["isolated_pass"] is True
+
+
+@pytest.mark.asyncio
+async def test_malformed_agent_check_returns_hint_without_hitting_shell(tmp_path, monkeypatch, fake_env):
+    agent = make_agent(tmp_path, monkeypatch, enable_self_test_gate=True, min_criteria=1, max_steps=1)
+    scripted = await run_agent(agent, fake_env, ["agent-check c1 test -f out.txt"])  # missing ` -- `
+    assert scripted.calls == 1
+
+    trajectory = json.loads((agent.logs_dir / "trajectory.json").read_text())
+    last_tool_msg = trajectory[-1]["content"]
+    assert "syntax not recognized" in last_tool_msg
+    assert "command not found" not in last_tool_msg
+
+    timing = read_timing(agent)
+    assert timing[-1].get("agent_check_malformed") is True
+
+
+@pytest.mark.asyncio
+async def test_implicit_submit_marker_is_gated(tmp_path, monkeypatch, fake_env):
+    """If a command's OUTPUT happens to contain the submit marker text (not
+    the model's requested command itself), that must still be gated — the
+    run should NOT finish, and the nudge should be appended rather than
+    replacing the command's real output.
+    """
+    agent = make_agent(
+        tmp_path, monkeypatch, enable_self_test_gate=True, min_criteria=1, max_gate_rejections=5, max_steps=1
+    )
+    # Built via string concatenation so the literal marker substring is NOT
+    # present in the requested command text (action type stays "command",
+    # not "done") — only the runtime OUTPUT contains it.
+    leak = "python3 -c \"print('COMPLETE_TASK' + '_AND_SUBMIT_FINAL_OUTPUT')\""
+    scripted = await run_agent(agent, fake_env, [leak])
+    assert scripted.calls == 1  # loop did NOT break — ran out of scripted turns instead
+
+    trajectory = json.loads((agent.logs_dir / "trajectory.json").read_text())
+    last_tool_msg = trajectory[-1]["content"]
+    assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in last_tool_msg  # original output preserved
+    assert "does not finish the task" in last_tool_msg
+    assert "Submit rejected" in last_tool_msg
+
+    state = read_self_test_state(agent)
+    assert state["gate_rejections"] == 1
+
+
+@pytest.mark.asyncio
+async def test_implicit_submit_marker_allowed_when_gate_satisfied(tmp_path, monkeypatch, fake_env):
+    agent = make_agent(tmp_path, monkeypatch, enable_self_test_gate=False, max_steps=1)
+    leak = "python3 -c \"print('COMPLETE_TASK' + '_AND_SUBMIT_FINAL_OUTPUT')\""
+    scripted = await run_agent(agent, fake_env, [leak])
+    assert scripted.calls == 1
+
+    trajectory = json.loads((agent.logs_dir / "trajectory.json").read_text())
+    # with the gate disabled, the pre-existing (baseline) ungated behavior
+    # is unchanged: the marker in output ends the run as before.
+    assert "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in trajectory[-1]["content"]
+
+
+# ---------------------------------------------------------------------------
 # Standalone: no edit tool present, no new model-facing tools
 # ---------------------------------------------------------------------------
 

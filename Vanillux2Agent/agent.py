@@ -66,35 +66,23 @@ _DOCKER_EXEC_ERROR_RE = re.compile(
 _SELF_TEST_PROMPT_ADDENDUM = """
 ## Self-testing (required before submit)
 
-Before you can submit, you must verify your work against the task's own
-acceptance criteria — not just "it looks right":
+Verify your work against the task's own acceptance criteria before submitting:
 
-1. Early on, turn the task's requirements (and any example input/output) into
-   a short list of testable acceptance criteria. Write them as JSON to
-   `{criteria_path}`:
-   ```json
-   {{
-     "criteria": [
-       {{"id": "short_stable_id", "description": "the observable property and its expected outcome", "how_to_check": "how you plan to verify this"}}
-     ],
-     "deliverables": ["path/to/your/solution/file", "..."]
-   }}
-   ```
-   `deliverables` should list the file(s) that make up your solution — only
-   these are copied into the isolated check environment (see below), so
-   scratch files/helpers you rely on won't be present there.
-2. Verify each criterion with: `agent-check <id> -- <command>` (this is a
-   harness convention, not a real binary — the harness intercepts it). The
-   check passes iff `<command>` exits 0, so use a real assertion (`test`,
-   `diff`, `grep -q`, `pytest`, `[[ ... ]]`, etc.) — a command with no
-   assertion, or one that only compares a program's output to itself, does
-   not count. `agent-check` also re-runs `<command>` in an ISOLATED copy of
-   your declared deliverables; only that isolated result counts, so a check
-   that passes only because of leftover files or a weakened deliverable will
-   fail there.
-3. You need at least {min_criteria} declared criteria each with a passing
-   `agent-check` before your submit will be accepted. Submitting early will
-   be rejected with a compact list of what's unmet.
+1. Early on, write testable criteria (turn any example input/output into one)
+   as JSON to `{criteria_path}`:
+   `{{"criteria": [{{"id": "short_id", "description": "...", "how_to_check": "..."}}], "deliverables": ["path/to/solution/file", ...]}}`
+   `deliverables` lists your solution file(s) — only these are copied into
+   each isolated check; scratch files/helpers won't be there.
+2. Verify each criterion with `agent-check <id> -- <command>` — a harness
+   convention, not a real binary. It must be on its own LINE (it can share a
+   bash call with setup on OTHER lines, but not chained with `&&`/`;` on the
+   SAME line). It passes iff `<command>` exits 0, so use a real assertion
+   (`test`, `diff`, `grep -q`, `pytest`, ...) — not a no-op or a comparison
+   of the program to itself. It also re-runs `<command>` against an
+   ISOLATED copy of your deliverables; only that result counts, so leftover
+   files or a weakened deliverable won't fake a pass.
+3. Submit needs >= {min_criteria} criteria each with a passing `agent-check`,
+   or it's rejected with a compact list of what's unmet.
 """
 
 
@@ -250,11 +238,22 @@ class Vanillux2Agent(BaseAgent):
                 command = action.get("command") or ""
                 tool_call_id = action.get("tool_call_id") or ""
 
-                check_match = st.parse_agent_check(command) if self.enable_self_test_gate else None
+                check_match: tuple[str, str, str] | None = None
+                if self.enable_self_test_gate:
+                    whole = st.parse_agent_check(command)
+                    if whole is not None:
+                        check_match = (whole[0], whole[1], "")
+                    else:
+                        check_match = st.extract_agent_check_line(command)
+
                 if check_match is not None:
-                    criterion_id, inner_command = check_match
+                    criterion_id, inner_command, remainder = check_match
                     t1 = time.monotonic()
-                    tool_content = await self._run_agent_check(
+                    prefix = ""
+                    if remainder:
+                        pre_result = await self._execute_bash(remainder, environment)
+                        prefix = self._format_tool_result(pre_result) + "\n\n"
+                    tool_content = prefix + await self._run_agent_check(
                         criterion_id, inner_command, self_test_state, session_exec, isolated_exec, step + 1
                     )
                     exec_time = time.monotonic() - t1
@@ -271,7 +270,25 @@ class Vanillux2Agent(BaseAgent):
                     )
                     continue
 
-                if action["type"] == "done" and self.enable_self_test_gate:
+                if self.enable_self_test_gate and st.looks_like_malformed_agent_check(command):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": st.AGENT_CHECK_SYNTAX_HINT,
+                        }
+                    )
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "agent_check_malformed": True,
+                        }
+                    )
+                    continue
+
+                is_explicit_submit = action["type"] == "done"
+                if is_explicit_submit and self.enable_self_test_gate:
                     criteria, _deliverables = await st.load_criteria(session_exec, self.self_test_config)
                     gate = st.evaluate_gate(criteria, self_test_state, self.self_test_config)
                     if not gate.allowed:
@@ -299,6 +316,28 @@ class Vanillux2Agent(BaseAgent):
                 exec_time = time.monotonic() - t1
 
                 tool_content = self._format_tool_result(result)
+
+                # A command can trip the submit sentinel by coincidence (its
+                # OUTPUT happens to contain the marker text) rather than by
+                # the model actually requesting the sentinel command — gate
+                # that path too, since it otherwise bypasses the gate
+                # entirely. Unlike the explicit path, the command already
+                # ran, so a rejection appends the nudge rather than replacing
+                # the (already-produced) output, and does not break the loop.
+                is_implicit_submit = (not is_explicit_submit) and SUBMIT_MARKER in tool_content
+                if is_implicit_submit and self.enable_self_test_gate:
+                    criteria, _deliverables = await st.load_criteria(session_exec, self.self_test_config)
+                    gate = st.evaluate_gate(criteria, self_test_state, self.self_test_config)
+                    if not gate.allowed:
+                        self_test_state.gate_rejections += 1
+                        tool_content += (
+                            "\n\n(NOTE: this output happened to contain the submit marker text, "
+                            "but that alone does not finish the task.) " + st.gate_nudge(gate)
+                        )
+                        is_implicit_submit = False
+                    elif gate.forced:
+                        self_test_state.submitted_with_failing_checks = True
+
                 messages.append(
                     {
                         "role": "tool",
@@ -317,7 +356,7 @@ class Vanillux2Agent(BaseAgent):
                     }
                 )
 
-                if action["type"] == "done" or SUBMIT_MARKER in tool_content:
+                if is_explicit_submit or is_implicit_submit:
                     break
         finally:
             self.logs_dir.mkdir(parents=True, exist_ok=True)

@@ -37,6 +37,45 @@ def test_parse_agent_check_multiline_command():
     assert "sys.exit(0)" in inner
 
 
+def test_parse_agent_check_rejects_empty_command():
+    assert st.parse_agent_check("agent-check crit1 -- ") is None
+
+
+def test_extract_agent_check_line_finds_embedded_invocation():
+    command = "mkdir -p /app/out\nagent-check c1 -- test -f /app/out/result.txt\necho done"
+    found = st.extract_agent_check_line(command)
+    assert found is not None
+    cid, inner, remainder = found
+    assert cid == "c1"
+    assert inner == "test -f /app/out/result.txt"
+    assert remainder == "mkdir -p /app/out\necho done"
+
+
+def test_extract_agent_check_line_no_match_for_ordinary_multiline_command():
+    command = "mkdir -p /app/out\necho done"
+    assert st.extract_agent_check_line(command) is None
+
+
+def test_extract_agent_check_line_rejects_empty_command():
+    assert st.extract_agent_check_line("mkdir -p /app\nagent-check c1 -- \necho done") is None
+
+
+def test_looks_like_malformed_agent_check_true_for_botched_attempts():
+    assert st.looks_like_malformed_agent_check("agent-check c1") is True
+    assert st.looks_like_malformed_agent_check("agent-check c1 test -f out.txt") is True
+    assert st.looks_like_malformed_agent_check("agent-check c1 -- ") is True
+
+
+def test_looks_like_malformed_agent_check_false_for_valid_forms():
+    assert st.looks_like_malformed_agent_check("agent-check c1 -- pytest -q") is False
+    assert st.looks_like_malformed_agent_check("mkdir -p x\nagent-check c1 -- pytest -q") is False
+
+
+def test_looks_like_malformed_agent_check_false_for_unrelated_commands():
+    assert st.looks_like_malformed_agent_check("echo 'the agent-check convention...'") is False
+    assert st.looks_like_malformed_agent_check("# agent-check is a harness convention") is False
+
+
 # ---------------------------------------------------------------------------
 # criteria file parsing
 # ---------------------------------------------------------------------------

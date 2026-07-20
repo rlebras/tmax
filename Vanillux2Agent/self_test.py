@@ -17,8 +17,16 @@ Architecture
   current declaration; it is never inlined into the model-facing history.
 * **Checks** (Mechanism 2) are declared via the bash convention
   ``agent-check <id> -- <command>``, intercepted before it ever reaches the
-  shell (there is no real ``agent-check`` binary). ``command`` runs once and
-  the check passes iff it exits 0 — the standard bash idiom (``test``,
+  shell (there is no real ``agent-check`` binary) — either as the whole bash
+  call, or as one line within a larger multi-line call that also does setup
+  on other lines (``extract_agent_check_line``; the "remainder" runs
+  normally first). A line starting with the ``agent-check`` token that
+  matches neither form gets a corrective ``AGENT_CHECK_SYNTAX_HINT`` instead
+  of silently hitting the real shell as "command not found" (a real failure
+  mode observed in a 445-trial A/B: 12% of trials tried the convention and
+  got a shell error because they'd bundled it into a larger call the
+  original whole-command-only matcher couldn't see). ``command`` runs once
+  and the check passes iff it exits 0 — the standard bash idiom (``test``,
   ``diff``, ``grep -q``, ``pytest``, ...) already encodes the comparison, so
   no separate "expected value" protocol is needed. Only PASS/FAIL plus the
   first failing line is ever returned — never full output.
@@ -123,18 +131,85 @@ IsolatedExecFn = Callable[[str, str], Awaitable[Any]]
 
 # ---------------------------------------------------------------------------
 # agent-check convention parsing
+#
+# Two supported forms:
+#  1. Whole-command: the ENTIRE bash call is one agent-check invocation. Its
+#     inner command may itself be multi-line (e.g. a heredoc/python -c block).
+#  2. Line-embedded: `agent-check <id> -- <command>` appears as ONE LINE
+#     within a larger multi-line bash call that also does setup on other
+#     lines (very common in practice — models naturally bundle `mkdir ...`
+#     or comments alongside the check). The inner command is limited to that
+#     single line; everything else in the call ("the remainder") is run
+#     normally by the caller before the check executes.
+# A line that starts with the `agent-check` token but matches neither form
+# (missing ` -- `, empty id/command, ...) is almost certainly a botched
+# attempt rather than a comment or string literal — `looks_like_malformed_
+# agent_check` flags it so the caller can return a corrective hint instead of
+# letting the literal (non-existent) binary hit the real shell.
 # ---------------------------------------------------------------------------
 
 AGENT_CHECK_RE = re.compile(r"^\s*agent-check\s+(?P<id>\S+)\s+--\s+(?P<cmd>.+)$", re.DOTALL)
+# Same-line whitespace only (`[ \t]+`, not `\s+`) between tokens — unlike the
+# whole-command form above, this must NOT be able to span a newline, or a
+# check with no command on its own line would silently swallow the next
+# line's command as its own (a real bug caught by extract_agent_check_line's
+# own tests).
+AGENT_CHECK_LINE_RE = re.compile(r"(?m)^[ \t]*agent-check[ \t]+(?P<id>\S+)[ \t]+--[ \t]+(?P<cmd>.+?)[ \t]*$")
+AGENT_CHECK_ATTEMPT_RE = re.compile(r"(?m)^[ \t]*agent-check\b")
 
 
 def parse_agent_check(command: str) -> tuple[str, str] | None:
-    """Return ``(criterion_id, inner_command)`` if ``command`` uses the
-    ``agent-check <id> -- <command>`` convention, else ``None``."""
+    """Return ``(criterion_id, inner_command)`` if the ENTIRE ``command`` is
+    one ``agent-check <id> -- <command>`` invocation, else ``None``."""
     m = AGENT_CHECK_RE.match(command)
     if not m:
         return None
-    return m.group("id"), m.group("cmd").strip()
+    cmd = m.group("cmd").strip()
+    if not cmd:
+        return None
+    return m.group("id"), cmd
+
+
+def extract_agent_check_line(command: str) -> tuple[str, str, str] | None:
+    """Find an ``agent-check <id> -- <command>`` invocation embedded as one
+    line within a larger multi-line ``command``. Returns ``(criterion_id,
+    inner_command, remainder)`` where ``remainder`` is ``command`` with that
+    line removed (run normally by the caller, e.g. setup on other lines) —
+    or ``None`` if no such line is present.
+    """
+    m = AGENT_CHECK_LINE_RE.search(command)
+    if not m:
+        return None
+    cmd = m.group("cmd").strip()
+    if not cmd:
+        return None
+    start, end = m.span()
+    if end < len(command) and command[end] == "\n":
+        end += 1  # swallow the line's own trailing newline, not just its content
+    remainder = (command[:start] + command[end:]).strip()
+    return m.group("id"), cmd, remainder
+
+
+def looks_like_malformed_agent_check(command: str) -> bool:
+    """True if ``command`` contains a line that starts with the literal
+    ``agent-check`` token but matches neither supported form above — a
+    near-certain botched attempt (comments/string literals don't start a
+    shell line with this exact token), not a false positive worth chasing.
+    """
+    if parse_agent_check(command) or extract_agent_check_line(command):
+        return False
+    return bool(AGENT_CHECK_ATTEMPT_RE.search(command))
+
+
+AGENT_CHECK_SYNTAX_HINT = (
+    "agent-check: syntax not recognized — nothing was run. It must be the "
+    "exact form `agent-check <id> -- <command>` (id has no spaces; ` -- ` "
+    "separates it from <command>), either as the whole bash call or as its "
+    "own line within a larger call (setup on other lines still runs "
+    "normally). Example combined with setup:\n"
+    "  mkdir -p /app/out\n"
+    "  agent-check my_id -- test -f /app/out/result.txt"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -229,30 +304,43 @@ def _safe_dir_name(criterion_id: str) -> str:
     return _UNSAFE_ID_RE.sub("_", criterion_id).strip(".") or "check"
 
 
+_MISSING_MARKER = "__SELF_TEST_MISSING__:"
+
+
 async def prepare_isolated_root(
     exec_fn: ExecFn, config: SelfTestConfig, deliverables: list[str], cwd: str, criterion_id: str
 ) -> tuple[str, list[str]]:
     """Build a fresh directory containing only the declared deliverables, mirrored at
     their real absolute paths. Returns ``(isolated_cwd, missing_deliverable_paths)``.
+
+    Batched into a SINGLE ``exec_fn`` round trip (one per check was costing
+    2 + 2*len(deliverables) container round trips — a real chunk of the
+    latency/wall-clock overhead the gate adds per check) — each deliverable
+    copy is wrapped in ``|| echo MISSING:...`` so one failure doesn't abort
+    the rest, and missing ones are recovered by scanning stdout afterward.
     """
     root = f"{config.isolation_root}/{_safe_dir_name(criterion_id)}"
-    await exec_fn(f"rm -rf {shlex.quote(root)} && mkdir -p {shlex.quote(root)}")
-
     cwd = cwd or "/"
     isolated_cwd = root if cwd == "/" else f"{root}{cwd}"
-    await exec_fn(f"mkdir -p {shlex.quote(isolated_cwd)}")
 
-    missing: list[str] = []
+    parts = [
+        f"rm -rf {shlex.quote(root)}",
+        f"mkdir -p {shlex.quote(isolated_cwd)}",
+    ]
     for path in deliverables:
         abs_path = path if path.startswith("/") else f"{cwd.rstrip('/')}/{path}"
         dest = f"{root}{abs_path}"
         dest_dir = dest.rsplit("/", 1)[0]
-        result = await exec_fn(
-            f"mkdir -p {shlex.quote(dest_dir)} && cp -a {shlex.quote(abs_path)} {shlex.quote(dest)}"
+        marker = shlex.quote(f"{_MISSING_MARKER}{path}")
+        parts.append(
+            f"(mkdir -p {shlex.quote(dest_dir)} && cp -a {shlex.quote(abs_path)} {shlex.quote(dest)}) "
+            f"|| echo {marker}"
         )
-        if getattr(result, "return_code", 1) != 0:
-            missing.append(path)
-
+    result = await exec_fn("\n".join(parts))
+    output = getattr(result, "stdout", None) or ""
+    missing = [
+        line[len(_MISSING_MARKER):] for line in output.splitlines() if line.startswith(_MISSING_MARKER)
+    ]
     return isolated_cwd, missing
 
 
@@ -283,8 +371,12 @@ async def persist_state(exec_fn: ExecFn, config: SelfTestConfig, state: SelfTest
         "gate_rejections": state.gate_rejections,
         "submitted_with_failing_checks": state.submitted_with_failing_checks,
     }
-    await exec_fn(f"mkdir -p {shlex.quote(config.state_dir)}")
-    await exec_fn(f"cat > {shlex.quote(config.state_dir)}/checks.json <<'__SELF_TEST_STATE__'\n{json.dumps(doc, indent=2)}\n__SELF_TEST_STATE__")
+    script = (
+        f"mkdir -p {shlex.quote(config.state_dir)} && "
+        f"cat > {shlex.quote(config.state_dir)}/checks.json <<'__SELF_TEST_STATE__'\n"
+        f"{json.dumps(doc, indent=2)}\n__SELF_TEST_STATE__"
+    )
+    await exec_fn(script)
 
 
 async def run_agent_check(
