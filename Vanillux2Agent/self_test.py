@@ -19,8 +19,8 @@ Architecture
   ``agent-check <id> -- <command>``, intercepted before it ever reaches the
   shell (there is no real ``agent-check`` binary) — either as the whole bash
   call, or as one line within a larger multi-line call that also does setup
-  on other lines (``extract_agent_check_line``; the "remainder" runs
-  normally first). A line starting with the ``agent-check`` token that
+  on other lines, or several checks back to back (``extract_agent_check_lines``;
+  the "remainder" runs normally first). A line starting with the ``agent-check`` token that
   matches neither form gets a corrective ``AGENT_CHECK_SYNTAX_HINT`` instead
   of silently hitting the real shell as "command not found" (a real failure
   mode observed in a 445-trial A/B: 12% of trials tried the convention and
@@ -135,12 +135,13 @@ IsolatedExecFn = Callable[[str, str], Awaitable[Any]]
 # Two supported forms:
 #  1. Whole-command: the ENTIRE bash call is one agent-check invocation. Its
 #     inner command may itself be multi-line (e.g. a heredoc/python -c block).
-#  2. Line-embedded: `agent-check <id> -- <command>` appears as ONE LINE
+#  2. Line-embedded: `agent-check <id> -- <command>` appears as its OWN LINE
 #     within a larger multi-line bash call that also does setup on other
-#     lines (very common in practice — models naturally bundle `mkdir ...`
-#     or comments alongside the check). The inner command is limited to that
-#     single line; everything else in the call ("the remainder") is run
-#     normally by the caller before the check executes.
+#     lines, or checks several criteria back to back (both are very common
+#     in practice — models naturally bundle `mkdir ...`/comments alongside
+#     checks, and often verify multiple criteria in one action). Each inner
+#     command is limited to its own line; everything else in the call ("the
+#     remainder") is run normally by the caller before the checks execute.
 # A line that starts with the `agent-check` token but matches neither form
 # (missing ` -- `, empty id/command, ...) is almost certainly a botched
 # attempt rather than a comment or string literal — `looks_like_malformed_
@@ -152,7 +153,7 @@ AGENT_CHECK_RE = re.compile(r"^\s*agent-check\s+(?P<id>\S+)\s+--\s+(?P<cmd>.+)$"
 # Same-line whitespace only (`[ \t]+`, not `\s+`) between tokens — unlike the
 # whole-command form above, this must NOT be able to span a newline, or a
 # check with no command on its own line would silently swallow the next
-# line's command as its own (a real bug caught by extract_agent_check_line's
+# line's command as its own (a real bug caught by extract_agent_check_lines's
 # own tests).
 AGENT_CHECK_LINE_RE = re.compile(r"(?m)^[ \t]*agent-check[ \t]+(?P<id>\S+)[ \t]+--[ \t]+(?P<cmd>.+?)[ \t]*$")
 AGENT_CHECK_ATTEMPT_RE = re.compile(r"(?m)^[ \t]*agent-check\b")
@@ -170,24 +171,32 @@ def parse_agent_check(command: str) -> tuple[str, str] | None:
     return m.group("id"), cmd
 
 
-def extract_agent_check_line(command: str) -> tuple[str, str, str] | None:
-    """Find an ``agent-check <id> -- <command>`` invocation embedded as one
-    line within a larger multi-line ``command``. Returns ``(criterion_id,
-    inner_command, remainder)`` where ``remainder`` is ``command`` with that
-    line removed (run normally by the caller, e.g. setup on other lines) —
-    or ``None`` if no such line is present.
+def extract_agent_check_lines(command: str) -> tuple[list[tuple[str, str]], str] | None:
+    """Find ALL ``agent-check <id> -- <command>`` invocations embedded as
+    their own lines within a larger multi-line ``command`` — models commonly
+    check several criteria back to back in one bash call, not just one.
+    Returns ``(checks, remainder)`` where ``checks`` is the ``(criterion_id,
+    inner_command)`` pairs in the order they appeared, and ``remainder`` is
+    ``command`` with all matched lines removed (run normally by the caller,
+    e.g. setup on other lines) — or ``None`` if no such line is present.
     """
-    m = AGENT_CHECK_LINE_RE.search(command)
-    if not m:
+    checks: list[tuple[str, str]] = []
+    spans: list[tuple[int, int]] = []
+    for m in AGENT_CHECK_LINE_RE.finditer(command):
+        cmd = m.group("cmd").strip()
+        if not cmd:
+            continue
+        checks.append((m.group("id"), cmd))
+        spans.append(m.span())
+    if not checks:
         return None
-    cmd = m.group("cmd").strip()
-    if not cmd:
-        return None
-    start, end = m.span()
-    if end < len(command) and command[end] == "\n":
-        end += 1  # swallow the line's own trailing newline, not just its content
-    remainder = (command[:start] + command[end:]).strip()
-    return m.group("id"), cmd, remainder
+
+    remainder = command
+    for start, end in sorted(spans, reverse=True):
+        if end < len(remainder) and remainder[end] == "\n":
+            end += 1  # swallow the line's own trailing newline, not just its content
+        remainder = remainder[:start] + remainder[end:]
+    return checks, remainder.strip()
 
 
 def looks_like_malformed_agent_check(command: str) -> bool:
@@ -196,7 +205,7 @@ def looks_like_malformed_agent_check(command: str) -> bool:
     near-certain botched attempt (comments/string literals don't start a
     shell line with this exact token), not a false positive worth chasing.
     """
-    if parse_agent_check(command) or extract_agent_check_line(command):
+    if parse_agent_check(command) or extract_agent_check_lines(command):
         return False
     return bool(AGENT_CHECK_ATTEMPT_RE.search(command))
 
@@ -210,6 +219,26 @@ AGENT_CHECK_SYNTAX_HINT = (
     "  mkdir -p /app/out\n"
     "  agent-check my_id -- test -f /app/out/result.txt"
 )
+
+# In a 445-trial A/B, 15 trials probed for the binary this way — almost
+# always followed by the model concluding agent-check "isn't available" and
+# giving up on the mechanism (self-simulating fake PASS/FAIL text instead).
+# `which`/`type`/`command -v` genuinely can't find it (it's intercepted, not
+# on PATH), so answer the probe directly instead of letting that cascade start.
+EXISTENCE_PROBE_RE = re.compile(r"\b(?:which|type|command\s+-v)\s+agent-check\b")
+
+AGENT_CHECK_EXISTENCE_HINT = (
+    "agent-check is a harness convention intercepted from the bash command "
+    "stream — it is NOT a real binary on PATH, so `which`/`type`/`command -v` "
+    "will always report it missing. That's expected; just run it directly: "
+    "`agent-check <id> -- <command>`."
+)
+
+
+def looks_like_existence_probe(command: str) -> bool:
+    """True if ``command`` checks whether ``agent-check`` exists as a real
+    binary (``which``/``type``/``command -v``) rather than using it."""
+    return bool(EXISTENCE_PROBE_RE.search(command))
 
 
 # ---------------------------------------------------------------------------

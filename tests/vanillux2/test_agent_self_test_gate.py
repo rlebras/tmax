@@ -118,7 +118,7 @@ async def test_submit_rejected_then_accepted(tmp_path, monkeypatch, fake_env):
 
     timing = read_timing(agent)
     assert any(t.get("gate_rejected") for t in timing)
-    assert any(t.get("agent_check") == "c1" for t in timing)
+    assert any(t.get("agent_check") == ["c1"] for t in timing)
 
     state = read_self_test_state(agent)
     assert state["gate_rejections"] == 1
@@ -242,6 +242,50 @@ async def test_bundled_agent_check_runs_setup_then_check(tmp_path, monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_multiple_agent_checks_in_one_call_both_run(tmp_path, monkeypatch, fake_env):
+    """Reproduces a real failure traced from a terminal-bench-2.1 A/B run
+    (break-filter-js-from-html__RmXA7Zs): the model checked two criteria back
+    to back in one bash call. The first got intercepted; the second — left in
+    the "remainder" by the single-check extractor — hit the real shell as
+    `agent-check: command not found`. Both must now be intercepted.
+    """
+    agent = make_agent(tmp_path, monkeypatch, enable_self_test_gate=True, min_criteria=2, max_steps=2)
+    criteria_path = agent.self_test_config.criteria_path
+    declare = (
+        f"mkdir -p {Path(criteria_path).parent} && cat > {criteria_path} <<'EOF'\n"
+        '{"criteria": ['
+        '{"id": "c1", "description": "out.txt exists", "how_to_check": "test -f"}, '
+        '{"id": "c2", "description": "prints 42", "how_to_check": "run solution.py"}'
+        '], "deliverables": ["out.txt", "solution.py"]}\n'
+        "EOF\n"
+        "touch out.txt\n"
+        "cat > solution.py <<'EOF'\nprint(42)\nEOF"
+    )
+    both_checks = (
+        "echo 'Checking criterion 1'\n"
+        "agent-check c1 -- test -f out.txt\n"
+        "echo 'Checking criterion 2'\n"
+        'agent-check c2 -- test "$(python3 solution.py)" = "42"'
+    )
+
+    scripted = await run_agent(agent, fake_env, [declare, both_checks])
+    assert scripted.calls == 2
+
+    trajectory = json.loads((agent.logs_dir / "trajectory.json").read_text())
+    last_tool_msg = trajectory[-1]["content"]
+    assert "agent-check c1: PASS (isolated)" in last_tool_msg
+    assert "agent-check c2: PASS (isolated)" in last_tool_msg
+    assert "command not found" not in last_tool_msg
+
+    state = read_self_test_state(agent)
+    assert state["checks"]["c1"][0]["isolated_pass"] is True
+    assert state["checks"]["c2"][0]["isolated_pass"] is True
+
+    timing = read_timing(agent)
+    assert any(t.get("agent_check") == ["c1", "c2"] for t in timing)
+
+
+@pytest.mark.asyncio
 async def test_malformed_agent_check_returns_hint_without_hitting_shell(tmp_path, monkeypatch, fake_env):
     agent = make_agent(tmp_path, monkeypatch, enable_self_test_gate=True, min_criteria=1, max_steps=1)
     scripted = await run_agent(agent, fake_env, ["agent-check c1 test -f out.txt"])  # missing ` -- `
@@ -254,6 +298,37 @@ async def test_malformed_agent_check_returns_hint_without_hitting_shell(tmp_path
 
     timing = read_timing(agent)
     assert timing[-1].get("agent_check_malformed") is True
+
+
+@pytest.mark.asyncio
+async def test_existence_probe_returns_hint_without_hitting_shell(tmp_path, monkeypatch, fake_env):
+    """Reproduces a pattern seen in 15/445 trials of a terminal-bench-2.1 A/B
+    run: the model checks whether agent-check is a real binary before using
+    it, gets a correct-but-unhelpful "not found", and in several traced cases
+    concluded the mechanism was unavailable and gave up on it entirely.
+    """
+    agent = make_agent(tmp_path, monkeypatch, enable_self_test_gate=True, min_criteria=1, max_steps=1)
+    # the exact form seen in distribution-search__P7Yw4DN
+    scripted = await run_agent(agent, fake_env, ['which agent-check || echo "agent-check not found"'])
+    assert scripted.calls == 1
+
+    trajectory = json.loads((agent.logs_dir / "trajectory.json").read_text())
+    last_tool_msg = trajectory[-1]["content"]
+    assert "real binary on PATH" in last_tool_msg
+    assert "agent-check not found" not in last_tool_msg  # the real `which` never ran
+
+    timing = read_timing(agent)
+    assert timing[-1].get("agent_check_existence_probe") is True
+
+
+@pytest.mark.asyncio
+async def test_existence_probe_inert_when_gate_disabled(tmp_path, monkeypatch, fake_env):
+    agent = make_agent(tmp_path, monkeypatch, enable_self_test_gate=False, max_steps=1)
+    scripted = await run_agent(agent, fake_env, ["which agent-check || echo not-found"])
+    assert scripted.calls == 1
+    trajectory = json.loads((agent.logs_dir / "trajectory.json").read_text())
+    # gate disabled -> ordinary bash command, the real (failing) `which` ran
+    assert "not-found" in trajectory[-1]["content"]
 
 
 @pytest.mark.asyncio

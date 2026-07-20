@@ -41,23 +41,49 @@ def test_parse_agent_check_rejects_empty_command():
     assert st.parse_agent_check("agent-check crit1 -- ") is None
 
 
-def test_extract_agent_check_line_finds_embedded_invocation():
+def test_extract_agent_check_lines_finds_embedded_invocation():
     command = "mkdir -p /app/out\nagent-check c1 -- test -f /app/out/result.txt\necho done"
-    found = st.extract_agent_check_line(command)
+    found = st.extract_agent_check_lines(command)
     assert found is not None
-    cid, inner, remainder = found
-    assert cid == "c1"
-    assert inner == "test -f /app/out/result.txt"
+    checks, remainder = found
+    assert checks == [("c1", "test -f /app/out/result.txt")]
     assert remainder == "mkdir -p /app/out\necho done"
 
 
-def test_extract_agent_check_line_no_match_for_ordinary_multiline_command():
+def test_extract_agent_check_lines_finds_multiple_invocations():
+    command = (
+        "echo start\n"
+        "agent-check c1 -- test -f /app/out.txt\n"
+        "agent-check c2 -- python3 -c \"import sys; sys.exit(0)\"\n"
+        "echo end"
+    )
+    found = st.extract_agent_check_lines(command)
+    assert found is not None
+    checks, remainder = found
+    assert checks == [
+        ("c1", "test -f /app/out.txt"),
+        ("c2", 'python3 -c "import sys; sys.exit(0)"'),
+    ]
+    assert remainder == "echo start\necho end"
+
+
+def test_extract_agent_check_lines_no_match_for_ordinary_multiline_command():
     command = "mkdir -p /app/out\necho done"
-    assert st.extract_agent_check_line(command) is None
+    assert st.extract_agent_check_lines(command) is None
 
 
-def test_extract_agent_check_line_rejects_empty_command():
-    assert st.extract_agent_check_line("mkdir -p /app\nagent-check c1 -- \necho done") is None
+def test_extract_agent_check_lines_skips_empty_command_lines():
+    # one well-formed line + one with an empty command -> only the good one counts
+    command = "agent-check c1 -- \nagent-check c2 -- pytest -q"
+    found = st.extract_agent_check_lines(command)
+    assert found is not None
+    checks, remainder = found
+    assert checks == [("c2", "pytest -q")]
+    assert remainder == "agent-check c1 --"
+
+
+def test_extract_agent_check_lines_none_when_all_commands_empty():
+    assert st.extract_agent_check_lines("mkdir -p /app\nagent-check c1 -- \necho done") is None
 
 
 def test_looks_like_malformed_agent_check_true_for_botched_attempts():
@@ -69,11 +95,30 @@ def test_looks_like_malformed_agent_check_true_for_botched_attempts():
 def test_looks_like_malformed_agent_check_false_for_valid_forms():
     assert st.looks_like_malformed_agent_check("agent-check c1 -- pytest -q") is False
     assert st.looks_like_malformed_agent_check("mkdir -p x\nagent-check c1 -- pytest -q") is False
+    assert st.looks_like_malformed_agent_check(
+        "agent-check c1 -- pytest -q\nagent-check c2 -- pytest -q2"
+    ) is False
 
 
 def test_looks_like_malformed_agent_check_false_for_unrelated_commands():
     assert st.looks_like_malformed_agent_check("echo 'the agent-check convention...'") is False
     assert st.looks_like_malformed_agent_check("# agent-check is a harness convention") is False
+
+
+def test_looks_like_existence_probe_true_for_which_type_command_v():
+    assert st.looks_like_existence_probe("which agent-check") is True
+    assert st.looks_like_existence_probe('which agent-check || echo "not found"') is True
+    assert st.looks_like_existence_probe("type agent-check") is True
+    assert st.looks_like_existence_probe("command -v agent-check") is True
+    assert st.looks_like_existence_probe(
+        "which agent-check 2>/dev/null || echo missing\nls -la /"
+    ) is True
+
+
+def test_looks_like_existence_probe_false_for_unrelated_commands():
+    assert st.looks_like_existence_probe("agent-check c1 -- pytest -q") is False
+    assert st.looks_like_existence_probe("which python3") is False
+    assert st.looks_like_existence_probe("echo 'agent-check is a harness convention'") is False
 
 
 # ---------------------------------------------------------------------------

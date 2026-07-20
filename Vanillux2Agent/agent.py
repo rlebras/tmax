@@ -74,9 +74,11 @@ Verify your work against the task's own acceptance criteria before submitting:
    `deliverables` lists your solution file(s) — only these are copied into
    each isolated check; scratch files/helpers won't be there.
 2. Verify each criterion with `agent-check <id> -- <command>` — a harness
-   convention, not a real binary. It must be on its own LINE (it can share a
-   bash call with setup on OTHER lines, but not chained with `&&`/`;` on the
-   SAME line). It passes iff `<command>` exits 0, so use a real assertion
+   convention, not a real binary, so don't bother checking with `which`/
+   `type`/`command -v` first (it will correctly report "not found" — that's
+   expected, just run it). It must be on its own LINE (it can share a bash
+   call with setup on OTHER lines, but not chained with `&&`/`;` on the SAME
+   line). It passes iff `<command>` exits 0, so use a real assertion
    (`test`, `diff`, `grep -q`, `pytest`, ...) — not a no-op or a comparison
    of the program to itself. It also re-runs `<command>` against an
    ISOLATED copy of your deliverables; only that result counts, so leftover
@@ -238,24 +240,36 @@ class Vanillux2Agent(BaseAgent):
                 command = action.get("command") or ""
                 tool_call_id = action.get("tool_call_id") or ""
 
-                check_match: tuple[str, str, str] | None = None
+                checks: list[tuple[str, str]] = []
+                remainder = ""
                 if self.enable_self_test_gate:
                     whole = st.parse_agent_check(command)
                     if whole is not None:
-                        check_match = (whole[0], whole[1], "")
+                        checks = [whole]
                     else:
-                        check_match = st.extract_agent_check_line(command)
+                        found = st.extract_agent_check_lines(command)
+                        if found is not None:
+                            checks, remainder = found
 
-                if check_match is not None:
-                    criterion_id, inner_command, remainder = check_match
+                if checks:
                     t1 = time.monotonic()
                     prefix = ""
                     if remainder:
-                        pre_result = await self._execute_bash(remainder, environment)
-                        prefix = self._format_tool_result(pre_result) + "\n\n"
-                    tool_content = prefix + await self._run_agent_check(
-                        criterion_id, inner_command, self_test_state, session_exec, isolated_exec, step + 1
-                    )
+                        if st.looks_like_malformed_agent_check(remainder):
+                            # e.g. a well-formed check alongside a botched one
+                            # on another line — don't let the botched one hit
+                            # the real shell as "command not found".
+                            prefix = st.AGENT_CHECK_SYNTAX_HINT + "\n\n"
+                        else:
+                            pre_result = await self._execute_bash(remainder, environment)
+                            prefix = self._format_tool_result(pre_result) + "\n\n"
+                    check_outputs = [
+                        await self._run_agent_check(
+                            criterion_id, inner_command, self_test_state, session_exec, isolated_exec, step + 1
+                        )
+                        for criterion_id, inner_command in checks
+                    ]
+                    tool_content = prefix + "\n\n".join(check_outputs)
                     exec_time = time.monotonic() - t1
                     messages.append(
                         {"role": "tool", "tool_call_id": tool_call_id, "content": tool_content}
@@ -265,7 +279,7 @@ class Vanillux2Agent(BaseAgent):
                             "step": step + 1,
                             "llm_s": round(llm_time, 1),
                             "bash_s": round(exec_time, 1),
-                            "agent_check": criterion_id,
+                            "agent_check": [cid for cid, _ in checks],
                         }
                     )
                     continue
@@ -283,6 +297,23 @@ class Vanillux2Agent(BaseAgent):
                             "step": step + 1,
                             "llm_s": round(llm_time, 1),
                             "agent_check_malformed": True,
+                        }
+                    )
+                    continue
+
+                if self.enable_self_test_gate and st.looks_like_existence_probe(command):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": st.AGENT_CHECK_EXISTENCE_HINT,
+                        }
+                    )
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "agent_check_existence_probe": True,
                         }
                     )
                     continue
