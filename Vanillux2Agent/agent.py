@@ -78,11 +78,13 @@ Verify your work against the task's own acceptance criteria before submitting:
    `type`/`command -v` first (it will correctly report "not found" — that's
    expected, just run it). It must be on its own LINE (it can share a bash
    call with setup on OTHER lines, but not chained with `&&`/`;` on the SAME
-   line). It passes iff `<command>` exits 0, so use a real assertion
-   (`test`, `diff`, `grep -q`, `pytest`, ...) — not a no-op or a comparison
-   of the program to itself. It also re-runs `<command>` against an
-   ISOLATED copy of your deliverables; only that result counts, so leftover
-   files or a weakened deliverable won't fake a pass.
+   line). It passes iff `<command>` EXITS non-zero on failure — so use
+   `assert`/`test`/`diff`/`grep -q`/`pytest`, not a comparison whose result
+   is only printed (`print(a == b)` always exits 0, pass or fail) and not
+   `cmd && echo PASS || echo FAIL` (that always exits 0 too — `echo` never
+   fails). It also re-runs `<command>` against an ISOLATED copy of your
+   deliverables; only that result counts, so leftover files or a weakened
+   deliverable won't fake a pass.
 3. Submit needs >= {min_criteria} criteria each with a passing `agent-check`,
    or it's rejected with a compact list of what's unmet.
 """

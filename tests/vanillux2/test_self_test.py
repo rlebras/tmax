@@ -200,6 +200,39 @@ def test_circularity_flags_no_assertion_hint():
     assert flags and "no recognizable assertion" in flags[0]
 
 
+def test_circularity_flags_print_comparison_with_no_exit_mechanism():
+    # verbatim structure from a real trace (regex-log__KoqF6iQ) that let a
+    # wrong regex through the gate: the `== [...]` never affects exit code.
+    flags = st.circularity_flags(
+        "python3 -c \"import re; p=open('/app/regex.txt').read().strip(); "
+        "print(re.findall(p, '192.168.1.1 2023-01-15', re.MULTILINE)) == ['2023-01-15']\""
+    )
+    assert any("doesn't make the process exit non-zero" in f for f in flags)
+
+
+def test_circularity_flags_comparison_with_assert_not_flagged():
+    flags = st.circularity_flags('python3 -c "assert 1 + 1 == 2"')
+    assert flags == []
+
+
+def test_circularity_flags_trailing_echo_fallback():
+    # verbatim structure from a real trace (break-filter-js-from-html__RmXA7Zs)
+    flags = st.circularity_flags("test -f /app/out.html && echo 'PASS' || echo 'FAIL'")
+    assert any("exit code is always 0" in f for f in flags)
+    flags2 = st.circularity_flags('timeout 5 /app/release && echo "PASS" || echo "FAIL"')
+    assert any("exit code is always 0" in f for f in flags2)
+
+
+def test_circularity_flags_bare_or_echo_fallback():
+    flags = st.circularity_flags('which agent-check || echo "not found"')
+    assert any("exit code is always 0" in f for f in flags)
+
+
+def test_circularity_flags_real_test_without_echo_fallback_not_flagged_for_that_reason():
+    flags = st.circularity_flags("test -f /app/out.html")
+    assert not any("exit code is always 0" in f for f in flags)
+
+
 def test_weakening_warning_no_history():
     state = st.SelfTestState()
     assert st.weakening_warning("c1", "pytest -q", state) is None

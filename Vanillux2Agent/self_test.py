@@ -57,7 +57,11 @@ Architecture
   non-blocking: a circular/trivial check is flagged and excluded from
   coverage; changing a check's command right after it failed in isolation is
   flagged as a possible weakening (warn, don't block — a self-test can
-  legitimately need fixing).
+  legitimately need fixing). Two exit-code-blind patterns found live in a
+  445-trial A/B (a `python -c "print(a == b)"` whose comparison never
+  reaches an `assert`/`sys.exit`, and `cmd && echo PASS || echo FAIL`, which
+  always exits 0 because `echo` never fails) let a wrong deliverable through
+  the gate several times before being caught here — both are now flagged.
 """
 
 from __future__ import annotations
@@ -282,9 +286,21 @@ async def load_criteria(exec_fn: ExecFn, config: SelfTestConfig) -> tuple[dict[s
 # ---------------------------------------------------------------------------
 
 _TRIVIAL_COMMAND_RE = re.compile(r"^\s*(true|:|exit\s+0)\s*$")
-_ASSERTION_HINTS = ("assert", "==", "!=", "diff", "grep", "pytest", "unittest", "[[", "[ ", "cmp ", "test ")
+# Constructs whose OWN exit status genuinely reflects success/failure. `==`/
+# `!=` deliberately excluded — see _check_bare_comparison below: a bare
+# comparison (e.g. inside `print(...)`, or as an unused expression like
+# `print(x) == y`) doesn't affect the exit code by itself, so treating it as
+# sufficient evidence of "a real assertion" (as an earlier version of this
+# heuristic did) let checks that can never fail regardless of the underlying
+# condition pass a 445-trial A/B undetected.
+_REAL_ASSERTION_HINTS = ("assert", "diff", "grep", "pytest", "unittest", "[[", "[ ", "cmp ", "test ")
 _SELF_DIFF_RE = re.compile(r"diff\s+<\((?P<a>.+?)\)\s+<\((?P<b>.+?)\)")
 _SELF_EQ_RE = re.compile(r"\[\[?\s*[\"']?\$\((?P<a>.+?)\)[\"']?\s*(?:==|=)\s*[\"']?\$\((?P<b>.+?)\)[\"']?\s*\]\]?")
+# `cmd && echo PASS || echo FAIL` (or just `cmd || echo ...`) always exits 0
+# — `echo` never fails — regardless of what `cmd` actually did. Seen
+# verbatim in a real trace (`test -f /app/out.html && echo 'PASS' || echo
+# 'FAIL'`) that let a wrong deliverable through the gate undetected.
+_TRAILING_ECHO_FALLBACK_RE = re.compile(r"\|\|\s*echo\b[^|&;]*$")
 
 
 def circularity_flags(command: str) -> list[str]:
@@ -292,10 +308,24 @@ def circularity_flags(command: str) -> list[str]:
     flags: list[str] = []
     cmd = command or ""
 
+    has_real_assertion = any(h in cmd for h in _REAL_ASSERTION_HINTS)
     if _TRIVIAL_COMMAND_RE.match(cmd):
         flags.append("command is a no-op (`true`/`:`/`exit 0`) with no real assertion")
-    elif not any(h in cmd for h in _ASSERTION_HINTS):
-        flags.append("no recognizable assertion in `command` (no test/diff/grep/assert/pytest/...)")
+    elif not has_real_assertion:
+        if "==" in cmd or "!=" in cmd:
+            flags.append(
+                "uses `==`/`!=` but nothing (assert/test/diff/grep/pytest/...) enforces it — "
+                "a bare comparison (e.g. inside `print(...)`, or as an unused expression) "
+                "doesn't make the process exit non-zero on a mismatch"
+            )
+        else:
+            flags.append("no recognizable assertion in `command` (no test/diff/grep/assert/pytest/...)")
+
+    if _TRAILING_ECHO_FALLBACK_RE.search(cmd.rstrip()):
+        flags.append(
+            "ends in `|| echo ...` (or `cmd && echo PASS || echo FAIL`) — `echo` always "
+            "succeeds, so the check's exit code is always 0 regardless of what came before it"
+        )
 
     for rx in (_SELF_DIFF_RE, _SELF_EQ_RE):
         m = rx.search(cmd)
