@@ -108,3 +108,50 @@ format_error_template: |
   Please always provide EXACTLY ONE call to the `bash` tool. If you want to
   end the task, please issue the command `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
   via the `bash` tool, with no other content in the command.
+
+# ---------------------------------------------------------------------------
+# Self-test gate addendum — used only by Vanillux2Agent when
+# enable_self_test_gate is True (see Vanillux2Agent/self_test.py). A NEW,
+# additive key: appended to the instance template above, never replacing it.
+# A failure analysis of 445 runs found most wrong-but-submitted solutions
+# declared success without ever running an independent check against the
+# task's stated criteria — this addendum, plus the submit gate in agent.py,
+# is the harness-side fix. On this branch the agent keeps the plain bash-only
+# tool contract, so self-testing rides the intercepted `agent-check` command
+# convention rather than dedicated tools. {{min_criteria}} and
+# {{criteria_path}} are filled in by agent.py from the live config.
+self_test_instance_addendum_bash: |
+
+  ## Self-testing (required before submit)
+
+  Verify your work against the task's own acceptance criteria before
+  submitting:
+
+  1. Early on, write at least {{min_criteria}} testable criteria (turn any
+     example input/output into one) as JSON to `{{criteria_path}}`:
+     `{"criteria": [{"id": "short_id", "description": "...", "how_to_check": "..."}], "deliverables": ["path/to/solution/file", ...]}`
+     `deliverables` lists your solution file(s) — only these are copied into
+     each isolated check; scratch files/helpers won't be there.
+  2. Verify each criterion with `agent-check <id> -- <command>` — a harness
+     convention, not a real binary, so don't bother checking with `which`/
+     `type`/`command -v` first (it will correctly report "not found" — that's
+     expected, just run it). It must be on its own LINE (it can share a bash
+     call with setup on OTHER lines, but not chained with `&&`/`;` on the SAME
+     line). It passes iff `<command>` EXITS non-zero on failure — nothing else
+     is checked, so a command that can't fail is worthless regardless of what
+     it looks like:
+       BAD:  `python3 -c "print(a == b)"` (prints True/False, always exits 0)
+       BAD:  `cmd && echo PASS || echo FAIL` (`echo` never fails, always exits 0)
+       GOOD: `python3 -c "assert a == b"` — or `test "$a" = "$b"`
+     Use an independent oracle, not a comparison of the program to itself:
+       - known-answer: `test "$(./solve input.txt)" = "42"` (a fixed value,
+       e.g. from the task's own example I/O)
+       - differential: `diff <(./solve.sh) <(python3 reference.py)` (two
+         independently-derived results)
+       - property/invariant: something that must structurally hold (round
+         trip, idempotence) rather than one hard-coded value
+     It also re-runs `<command>` against an ISOLATED copy of your
+     deliverables; only that result counts, so leftover files or a weakened
+     deliverable won't fake a pass.
+  3. Submit needs every declared criterion to have a passing `agent-check`,
+     or it's rejected with a compact list of what's unmet.

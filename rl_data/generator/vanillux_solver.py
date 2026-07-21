@@ -91,6 +91,12 @@ _INSTANCE_TEMPLATE: str = _VANILLUX_PROMPTS["instance_template"]
 _OBS_CFG: Dict[str, Any] = _VANILLUX_PROMPTS["observation"]
 _FORMAT_ERROR_TEMPLATE: str = _VANILLUX_PROMPTS["format_error_template"]
 
+# Self-test gate addendum (Vanillux2Agent with enable_self_test_gate=True
+# only — see the comment above this key in vanillux_prompts.yaml). Appended
+# to the instance template; never replaces it. The bash-only data-generation
+# harness below is unaffected.
+_SELF_TEST_INSTANCE_ADDENDUM_BASH: str = _VANILLUX_PROMPTS["self_test_instance_addendum_bash"]
+
 
 def _render_instance(task: str) -> str:
     """Render the vanillux instance template with the task description.
