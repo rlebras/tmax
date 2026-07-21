@@ -130,7 +130,10 @@ rather than blocked (Mechanism 5).
 
 Rejections are bounded by `max_gate_rejections`: once exhausted, submit is
 allowed regardless of coverage and `submitted_with_failing_checks=True` is
-recorded in `context.metadata` and `self_test.json`. **The bound applies
+recorded in `context.metadata` and `self_test.json`. The gate also stands
+down (same flagged-submit path) when the agent's wall-clock deadline is
+imminent (`wall_clock_budget_sec` — see the context-management doc's
+wall-clock section): a flagged submit beats an `AgentTimeoutError` kill. **The bound applies
 uniformly** — whether the model never declared criteria at all or just
 can't get its checks passing — so either failure mode converts to a
 flagged, analyzable submit rather than burning the entire step budget (see

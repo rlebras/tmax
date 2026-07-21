@@ -35,6 +35,7 @@ import time
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import litellm
@@ -73,9 +74,18 @@ ABORT_EXCEPTIONS = (
 
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 2.0
-LLM_TIMEOUT_SECONDS = 5 * 60 * 60
 LLM_OUTER_TIMEOUT_BUFFER_SECONDS = 30
 _STATE_DIR = "/tmp/.vanillux2"
+# Model-requested command timeouts: the prompt tells the model to wrap long
+# commands with `timeout N <cmd>`; honor that by raising the exec deadline to
+# N plus this margin (bounded by max_command_timeout), so `timeout 300 make`
+# isn't killed at the default 120s while the model believes it has 300.
+_TIMEOUT_REQUEST_RE = re.compile(
+    r"\btimeout\s+(?:(?:-k|--kill-after|-s|--signal)(?:[= ]\S+)\s+|--foreground\s+|--preserve-status\s+)*"
+    r"(?P<n>\d+(?:\.\d+)?)(?P<unit>[smhd]?)\b"
+)
+_TIMEOUT_REQUEST_MARGIN_SECONDS = 30
+_TIMEOUT_UNIT_SECONDS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _COMPOSE_PROVIDER_RE = re.compile(
     r"\x1b\[4m>>>> Executing external compose provider "
     r'"[^"]*docker-compose"\. Please see podman-compose\(1\) for how to disable '
@@ -89,6 +99,24 @@ _DOCKER_EXEC_ERROR_RE = re.compile(
 # truncation (that's context_management.py, applied to the model-facing view
 # only). Guards against a runaway command dumping gigabytes of output.
 _RAW_OUTPUT_SAFETY_CAP_CHARS = 2_000_000
+
+
+def _looks_like_exec_timeout(exc: Exception) -> bool:
+    return isinstance(exc, asyncio.TimeoutError) or "timed out" in str(exc).lower()
+
+
+def _timed_out_result(timeout_sec: int) -> Any:
+    """Duck-types harbor's ExecResult for a command the harness terminated."""
+    return SimpleNamespace(
+        stdout="",
+        stderr=(
+            f"(harness) command did not finish within {timeout_sec}s and was terminated; "
+            "its effects may be partially applied. For long-running work, request more time "
+            "with an explicit `timeout N <cmd>` (N in seconds), run it in the background "
+            "with `nohup ... &` and poll, or break it into smaller steps."
+        ),
+        return_code=124,
+    )
 
 
 class Vanillux2Agent(BaseAgent):
@@ -126,6 +154,12 @@ class Vanillux2Agent(BaseAgent):
         max_gate_rejections: int = 3,
         self_test_check_timeout: int = 60,
         self_test_isolation_mode: str = "tempdir",
+        max_context_tokens: int | None = None,
+        context_headroom_tokens: int = 2048,
+        llm_timeout: int = 900,
+        max_command_timeout: int = 600,
+        wall_clock_budget_sec: float | None = None,
+        deadline_warning_sec: int = 300,
         **kwargs: Any,
     ) -> None:
         """
@@ -163,6 +197,36 @@ class Vanillux2Agent(BaseAgent):
             process, populated with only the declared deliverables) is
             currently implemented; see self_test.py's module docstring for
             why a fresh container isn't available at this layer.
+
+        Budget flags (context window + wall clock — measured on the 444-run
+        baseline these are the two dominant loss buckets):
+
+        max_context_tokens: the serving context window (e.g. 65536 for the
+            standard eval). When set, the model-facing rebuild is measured
+            each step and compaction escalates BEFORE a request would
+            overflow. When None, only the reactive path below applies.
+        context_headroom_tokens: safety margin subtracted (together with
+            max_tokens) from max_context_tokens for the proactive check —
+            token estimates are approximate, so leave slack. Reactive
+            recovery is unconditional: a ContextWindowExceededError from the
+            API escalates compaction and retries instead of ending the run
+            (up to context_management.MAX_COMPACTION_LEVEL).
+        llm_timeout: per-request LLM timeout in seconds (retried with
+            backoff). The old effectively-unbounded value let one hung
+            request eat an entire agent wall-clock budget.
+        max_command_timeout: upper bound on the exec deadline granted when
+            the model wraps a command with `timeout N ...` (the exec
+            deadline is raised to N + a margin, capped here). A command that
+            still overruns is terminated and reported to the model as a
+            timeout instead of crashing the run.
+        wall_clock_budget_sec: the agent's total wall-clock budget, if the
+            launcher knows it (harbor does not expose it to the agent).
+            When set, a one-time "finalize and submit now" nudge is injected
+            once remaining time drops below deadline_warning_sec, and the
+            self-test gate stops rejecting submits (a flagged submit beats
+            an AgentTimeoutError kill).
+        deadline_warning_sec: how early the deadline nudge/gate-standdown
+            fires.
         """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
@@ -184,6 +248,12 @@ class Vanillux2Agent(BaseAgent):
             head_lines=head_lines,
             tail_lines=tail_lines,
         )
+        self.max_context_tokens = max_context_tokens
+        self.context_headroom_tokens = context_headroom_tokens
+        self.llm_timeout = llm_timeout
+        self.max_command_timeout = max_command_timeout
+        self.wall_clock_budget_sec = wall_clock_budget_sec
+        self.deadline_warning_sec = deadline_warning_sec
         self.enable_self_test_gate = enable_self_test_gate
         if self_test_isolation_mode != "tempdir":
             raise ValueError(f"unsupported self_test_isolation_mode: {self_test_isolation_mode!r}")
@@ -288,14 +358,41 @@ class Vanillux2Agent(BaseAgent):
             # Deliberately bypasses _wrap_command: no persistent cwd/env
             # sourcing, no state-file updates — a genuinely fresh process per
             # self_test.py's isolation contract (Mechanism 3).
-            return await environment.exec(
-                command=f"cd {shlex.quote(cwd)} && {command}",
-                timeout_sec=self._self_test_config.check_timeout_sec,
-            )
+            try:
+                return await environment.exec(
+                    command=f"cd {shlex.quote(cwd)} && {command}",
+                    timeout_sec=self._self_test_config.check_timeout_sec,
+                )
+            except (asyncio.TimeoutError, RuntimeError) as exc:
+                # Same raise-on-timeout contract as _execute_bash: a slow
+                # check must count as a failed check, not end the run.
+                if not _looks_like_exec_timeout(exc):
+                    raise
+                return _timed_out_result(self._self_test_config.check_timeout_sec)
 
         spilled_indices: set[int] = set()
         compaction_stats = context_management.CompactionStats()
         self_test_state = self_test.SelfTestState()
+
+        # Overflow-recovery ladder (see context_management.escalate_config):
+        # sticky within a run — once the history has outgrown a level there
+        # is no point de-escalating, it would overflow again immediately.
+        compaction_level = 0
+        overflow_recoveries = 0
+        proactive_escalations = 0
+
+        run_deadline = (
+            time.monotonic() + self.wall_clock_budget_sec
+            if self.wall_clock_budget_sec is not None
+            else None
+        )
+        deadline_warned = False
+
+        def deadline_imminent() -> bool:
+            return (
+                run_deadline is not None
+                and (run_deadline - time.monotonic()) < self.deadline_warning_sec
+            )
 
         try:
             for step in range(self.max_steps):
@@ -309,21 +406,77 @@ class Vanillux2Agent(BaseAgent):
                     )
                     break
 
-                model_messages = await context_management.build_model_messages(
-                    messages,
-                    config=self._compaction_config,
-                    model=model,
-                    ops=ops,
-                    spilled_indices=spilled_indices,
-                    stats=compaction_stats,
-                    logger=logger,
-                )
+                if run_deadline is not None and not deadline_warned and deadline_imminent():
+                    deadline_warned = True
+                    remaining = max(0, int(run_deadline - time.monotonic()))
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"(harness) Wall-clock budget nearly exhausted (~{remaining}s left). "
+                                "Stop exploring: make sure your solution is saved to its "
+                                "deliverable files now, then submit with "
+                                "`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`."
+                            ),
+                        }
+                    )
+
+                # Proactive budget enforcement: estimate the rebuilt prompt
+                # and escalate compaction BEFORE a request would overflow.
+                # Best-effort (token estimates are approximate) — the
+                # reactive recovery below is the guaranteed backstop.
+                while True:
+                    compaction_config = context_management.escalate_config(
+                        self._compaction_config, compaction_level
+                    )
+                    model_messages = await context_management.build_model_messages(
+                        messages,
+                        config=compaction_config,
+                        model=model,
+                        ops=ops,
+                        spilled_indices=spilled_indices,
+                        stats=compaction_stats,
+                        logger=logger,
+                    )
+                    if (
+                        self.max_context_tokens is None
+                        or compaction_level >= context_management.MAX_COMPACTION_LEVEL
+                    ):
+                        break
+                    prompt_budget = (
+                        self.max_context_tokens - self.max_tokens - self.context_headroom_tokens
+                    )
+                    estimate = context_management.estimate_messages_tokens(model_messages, model)
+                    if estimate <= prompt_budget:
+                        break
+                    compaction_level += 1
+                    proactive_escalations += 1
+                    logger.warning(
+                        "Estimated prompt %s tokens > budget %s; escalating compaction to level %s",
+                        estimate,
+                        prompt_budget,
+                        compaction_level,
+                    )
 
                 t0 = time.monotonic()
                 try:
                     response = await self._query_with_retry(model, model_messages)
                 except litellm.exceptions.ContextWindowExceededError:
-                    logger.warning("Context window exceeded; stopping current run")
+                    # Reactive overflow recovery: rebuild under harsher
+                    # compaction and keep going (costs this one loop step,
+                    # bounded by MAX_COMPACTION_LEVEL) instead of abandoning
+                    # the run's remaining steps — on the measured baseline,
+                    # unsubmitted runs pass at 1.7% vs 49% for submitted
+                    # ones, so giving up here forfeits nearly everything.
+                    if compaction_level < context_management.MAX_COMPACTION_LEVEL:
+                        compaction_level += 1
+                        overflow_recoveries += 1
+                        logger.warning(
+                            "Context window exceeded; retrying at compaction level %s",
+                            compaction_level,
+                        )
+                        continue
+                    logger.warning("Context window exceeded at max compaction; stopping current run")
                     break
                 llm_time = time.monotonic() - t0
 
@@ -361,6 +514,21 @@ class Vanillux2Agent(BaseAgent):
                 messages.append(msg)
                 format_errors = 0
                 tool_call_id = action.get("tool_call_id") or ""
+                # The contract is one tool call per turn and only the first
+                # is executed — answer any extras so no tool_call_id is left
+                # unpaired (a strict OpenAI-protocol server rejects a history
+                # with orphaned calls on the NEXT request).
+                for extra_call in (msg.get("tool_calls") or [])[1:]:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": extra_call.get("id") or "",
+                            "content": (
+                                "(ignored: exactly one tool call per turn — "
+                                "this extra call was not executed)"
+                            ),
+                        }
+                    )
                 is_bash = action["name"] == "bash"
                 command = (action["args"].get("command") or "") if is_bash else ""
 
@@ -465,6 +633,10 @@ class Vanillux2Agent(BaseAgent):
                     gate = self_test.evaluate_gate(
                         criteria, self_test_state, self._self_test_config
                     )
+                    if not gate.allowed and deadline_imminent():
+                        # Deadline standdown: a flagged submit now beats an
+                        # AgentTimeoutError kill a few steps later.
+                        gate = self_test.GateResult(True, ["deadline imminent"], forced=True)
                     if not gate.allowed:
                         self_test_state.gate_rejections += 1
                         messages.append(
@@ -547,6 +719,8 @@ class Vanillux2Agent(BaseAgent):
                     gate = self_test.evaluate_gate(
                         criteria, self_test_state, self._self_test_config
                     )
+                    if not gate.allowed and deadline_imminent():
+                        gate = self_test.GateResult(True, ["deadline imminent"], forced=True)
                     if not gate.allowed:
                         self_test_state.gate_rejections += 1
                         tool_content += (
@@ -632,6 +806,13 @@ class Vanillux2Agent(BaseAgent):
                 "compaction": {
                     "stubbed_writes": compaction_stats.stubbed_writes,
                     "truncated_outputs": compaction_stats.truncated_outputs,
+                    "final_level": compaction_level,
+                    "overflow_recoveries": overflow_recoveries,
+                    "proactive_escalations": proactive_escalations,
+                },
+                "deadline": {
+                    "budget_sec": self.wall_clock_budget_sec,
+                    "warned": deadline_warned,
                 },
                 "self_test": {
                     "enabled": self.enable_self_test_gate,
@@ -659,7 +840,7 @@ class Vanillux2Agent(BaseAgent):
         )
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                llm_timeout = LLM_TIMEOUT_SECONDS
+                llm_timeout = self.llm_timeout
                 completion_kwargs: dict[str, Any] = {
                     "model": model,
                     "messages": messages,
@@ -747,13 +928,42 @@ class Vanillux2Agent(BaseAgent):
             "exit $_vanillux2_ec"
         )
 
+    def _requested_timeout_sec(self, command: str) -> int | None:
+        """Largest `timeout N` the model asked for anywhere in *command*."""
+        best: int | None = None
+        for m in _TIMEOUT_REQUEST_RE.finditer(command or ""):
+            seconds = int(float(m.group("n")) * _TIMEOUT_UNIT_SECONDS[m.group("unit")])
+            if best is None or seconds > best:
+                best = seconds
+        return best
+
+    def _command_deadline_sec(self, command: str) -> int:
+        requested = self._requested_timeout_sec(command)
+        if requested is None:
+            return self.command_timeout
+        granted = requested + _TIMEOUT_REQUEST_MARGIN_SECONDS
+        cap = max(self.max_command_timeout, self.command_timeout)
+        return min(max(self.command_timeout, granted), cap)
+
     async def _execute_bash(
         self, command: str, environment: BaseEnvironment
     ) -> Any:
-        return await environment.exec(
-            command=self._wrap_command(command),
-            timeout_sec=self.command_timeout,
-        )
+        timeout_sec = self._command_deadline_sec(command)
+        try:
+            return await environment.exec(
+                command=self._wrap_command(command),
+                timeout_sec=timeout_sec,
+            )
+        except (asyncio.TimeoutError, RuntimeError) as exc:
+            # harbor's docker environment RAISES on exec timeout (RuntimeError
+            # "Command timed out after Ns") rather than returning a result —
+            # unhandled, one slow command would end the whole run. Convert to
+            # a model-visible result instead; anything else is a real
+            # environment failure and still propagates.
+            if not _looks_like_exec_timeout(exc):
+                raise
+            logger.warning("Command timed out after %ss: %s", timeout_sec, command[:120])
+            return _timed_out_result(timeout_sec)
 
     @staticmethod
     def _format_tool_result(result: Any) -> str:

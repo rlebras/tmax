@@ -78,6 +78,24 @@ def _count_messages_tokens(messages: list[dict], model: str) -> int:
 async def replay_trajectory(path: Path, config: cm.CompactionConfig, model: str, spill_root: Path) -> dict:
     raw = json.loads(path.read_text())
     exec_fn = _make_replay_exec_fn(spill_root)
+
+    async def upload_bytes(content: bytes, remote_path: str) -> None:
+        # Replay "container" is the local filesystem, rooted at spill_root
+        # for relative paths (mirrors tests/vanillux2/conftest.py's ops).
+        target = Path(remote_path)
+        if not target.is_absolute():
+            target = spill_root / target
+        target.write_bytes(content)
+
+    async def download_bytes(remote_path: str) -> bytes:
+        target = Path(remote_path)
+        if not target.is_absolute():
+            target = spill_root / target
+        return target.read_bytes()
+
+    from container_ops import ContainerOps
+
+    ops = ContainerOps(exec_fn=exec_fn, upload_bytes=upload_bytes, download_bytes=download_bytes)
     spilled_indices: set[int] = set()
     stats = cm.CompactionStats()
 
@@ -101,7 +119,7 @@ async def replay_trajectory(path: Path, config: cm.CompactionConfig, model: str,
             prefix,
             config=config,
             model=model,
-            exec_fn=exec_fn,
+            ops=ops,
             spilled_indices=spilled_indices,
             stats=stats,
         )

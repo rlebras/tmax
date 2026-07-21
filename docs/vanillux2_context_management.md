@@ -247,3 +247,61 @@ against real local `bash` and implements `upload_bytes`/`download_bytes` as
 plain local file writes/reads — the test "container" is just the local
 filesystem, so these exercise the actual commands/paths this code generates
 without a hand-rolled fake shell or a real Docker daemon.
+
+## Overflow recovery + proactive budget enforcement
+
+Measured on the 444-trial baseline, the single largest loss bucket (38% of
+all runs) was runs that hit `ContextWindowExceededError` mid-task and gave
+up — at median step 27 of 64, with ~40–50k tokens of context dominated by
+tool-call *arguments* (full-file heredoc writes), and unsubmitted runs pass
+at 1.7% vs 49% for submitted ones. Two additions attack this directly:
+
+* **Reactive recovery** (always on): instead of breaking the loop, a
+  `ContextWindowExceededError` escalates a per-run **compaction level**
+  (`escalate_config`) and retries. Level 1 quarters per-message output
+  budgets, stubs writes sooner, and hard-truncates tool outputs older than a
+  trailing 8-turn window (`stale_output_keep_turns`); level 2 keeps only a
+  skeleton of everything but the last two turns. The level is sticky within
+  a run (de-escalating would immediately re-overflow) and the rebuild stays
+  a pure function of (raw log, config-at-level), so determinism is
+  preserved. Only past `MAX_COMPACTION_LEVEL` does the run end the old way.
+* **Proactive enforcement** (needs `max_context_tokens`, e.g. 65536 for the
+  standard eval): each step the rebuilt prompt is estimated
+  (`estimate_messages_tokens` — counts tool-call arguments, which dominate
+  in practice) and compaction escalates *before* a request would overflow,
+  keeping `max_tokens + context_headroom_tokens` of slack. Estimates are
+  approximate by design; the reactive path is the guaranteed backstop.
+
+Truncation also gained a **char-based fallback**: a token-heavy but
+line-sparse output (one huge minified line) used to be kept in full because
+head/tail-by-lines had nothing to elide — it is now head/tail-split by a
+char budget with the full body spilled, closing the one hole through which
+a single output could defeat the whole budget.
+
+`context.metadata["compaction"]` reports `final_level`,
+`overflow_recoveries`, and `proactive_escalations` per run. Replayed over
+real baseline trajectories (`scripts/vanillux2_context_report.py`),
+level-0 compaction alone cuts peak model-facing context by a mean 41.7%
+(median 39.7%, 25 trajectories: ~49.5k → ~28.5k tokens).
+
+## Wall-clock discipline
+
+The second-largest infrastructure bucket (7.4% of baseline runs) was
+`AgentTimeoutError` — the harness killing the agent mid-task. Three fixes,
+all on `Vanillux2Agent.__init__`:
+
+* `llm_timeout` (default 900s): the per-request LLM timeout was effectively
+  unbounded (5 h), so one hung request could eat an entire agent budget; it
+  is now bounded and retried with backoff.
+* Command timeouts: harbor's docker `exec` **raises** on timeout — one slow
+  command used to end the whole run as a harness exception. `_execute_bash`
+  (and the self-test gate's `isolated_exec`) now convert that into a
+  model-visible `exit_code=124` result explaining what happened. And since
+  the prompt already teaches `timeout N <cmd>`, the harness honors it: the
+  exec deadline is raised to N + 30s, capped by `max_command_timeout`
+  (default 600s) — 27% of baseline runs hit the flat 120s cap at least once.
+* Deadline awareness (`wall_clock_budget_sec`, opt-in — harbor does not
+  expose the budget to the agent, so the launcher must pass it): once
+  remaining time drops below `deadline_warning_sec`, a one-time "finalize
+  and submit now" nudge is injected and the self-test gate stops rejecting
+  submits (a flagged submit beats an AgentTimeoutError kill).

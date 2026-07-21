@@ -137,6 +137,17 @@ structured tool-calls** (it reads the `command` argument out of
   edits never need to put a whole file back into the conversation. See
   [`vanillux2_context_management.md`](vanillux2_context_management.md) for
   the full design, config flags, and measured token savings.
+- **Budget discipline:** a `ContextWindowExceededError` no longer ends the
+  run — compaction escalates (harsher truncation, stale-output elision) and
+  the loop retries, with an optional proactive check (`max_context_tokens`)
+  that escalates before a request would overflow. LLM requests are bounded
+  (`llm_timeout`, 15 min); a command that outruns its exec deadline becomes a
+  model-visible `exit_code=124` result instead of a run-ending exception, and
+  `timeout N <cmd>` in a command raises its deadline (capped by
+  `max_command_timeout`); an optional `wall_clock_budget_sec` injects a
+  finalize-now nudge near the deadline. See the
+  [budget sections](vanillux2_context_management.md#overflow-recovery--proactive-budget-enforcement)
+  of the context-management doc.
 - **Self-test gate:** the submit marker is honored only once the model has
   declared acceptance criteria and every one of them has a check that passed
   against an *isolated copy of its declared deliverables* (leftover scratch

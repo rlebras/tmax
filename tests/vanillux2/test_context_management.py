@@ -415,3 +415,159 @@ async def test_rebuild_is_deterministic_and_never_mutates_raw_log(ops, workdir):
 
     assert out1 == out2  # rebuilding from the same raw log twice is byte-identical
     assert raw == raw_snapshot  # the raw log itself was never mutated
+
+
+# ---------------------------------------------------------------------------
+# Char-fallback truncation — a token-heavy but line-sparse output (one huge
+# minified line) must still be bounded, not kept in full.
+# ---------------------------------------------------------------------------
+
+
+async def test_line_sparse_giant_output_gets_char_truncated(ops, workdir):
+    body = "x" * 60_000  # one line, no newlines to head/tail by
+    content = f"{body}\n\n(exit_code=0)"
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _assistant_bash("c1", "dump_minified"),
+        _tool("c1", content),
+    ]
+    config = cm.CompactionConfig(
+        max_tool_output_tokens=2000, head_lines=5, tail_lines=5, spill_dir=str(workdir / "spill")
+    )
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    tool_content = out[3]["content"]
+    assert len(tool_content) < 5_000  # bounded, nowhere near 60k
+    assert "truncated" in tool_content and "chars" in tool_content
+    assert "(exit_code=0)" in tool_content
+    assert stats.truncated_outputs == 1
+    spill_path = cm._spill_path(config, 3)
+    assert body in Path(spill_path).read_text()  # full body re-fetchable from disk
+
+
+async def test_line_sparse_output_under_cap_kept(ops):
+    content = ("y" * 400) + "\n\n(exit_code=0)"
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _assistant_bash("c1", "small"),
+        _tool("c1", content),
+    ]
+    config = cm.CompactionConfig(max_tool_output_tokens=2000)
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    assert out[3]["content"] == content
+
+
+# ---------------------------------------------------------------------------
+# Stale-output hard truncation (overflow-recovery lever)
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_outputs_forced_down_recent_kept(ops, workdir):
+    old_output = "\n".join(f"old{i}" for i in range(1, 31)) + "\n\n(exit_code=0)"
+    new_output = "\n".join(f"new{i}" for i in range(1, 31)) + "\n\n(exit_code=0)"
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _assistant_bash("c1", "step one"),
+        _tool("c1", old_output),
+        _assistant_bash("c2", "step two"),
+        _tool("c2", "mid\n\n(exit_code=0)"),
+        _assistant_bash("c3", "step three"),
+        _tool("c3", new_output),
+    ]
+    # Both 30-line outputs are far below the token cap — only staleness
+    # (older than 1 turn from the end) forces the first one down.
+    config = cm.CompactionConfig(
+        max_tool_output_tokens=2000,
+        stale_output_keep_turns=1,
+        stale_output_head_lines=3,
+        stale_output_tail_lines=2,
+        spill_dir=str(workdir / "spill"),
+    )
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    assert "truncated" in out[3]["content"] and "old15" not in out[3]["content"]
+    assert "old1" in out[3]["content"] and "old30" in out[3]["content"]  # tiny head/tail kept
+    assert out[7]["content"] == new_output  # the latest turn keeps its full output
+    assert cm._spill_path(config, 3) in out[3]["content"]
+
+
+async def test_stale_lever_off_by_default(ops):
+    output = "\n".join(f"l{i}" for i in range(1, 31)) + "\n\n(exit_code=0)"
+    raw = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "task"},
+        _assistant_bash("c1", "one"),
+        _tool("c1", output),
+        _assistant_bash("c2", "two"),
+        _tool("c2", "ok\n\n(exit_code=0)"),
+    ]
+    config = cm.CompactionConfig(max_tool_output_tokens=2000)
+    stats = cm.CompactionStats()
+    out = await cm.build_model_messages(
+        raw, config=config, model=None, ops=ops, spilled_indices=set(), stats=stats
+    )
+    assert out[3]["content"] == output
+
+
+# ---------------------------------------------------------------------------
+# Heredoc bodies are file CONTENT — redirects inside them are not writes.
+# ---------------------------------------------------------------------------
+
+
+def test_heredoc_body_redirects_are_not_phantom_writes():
+    cmd = "cat > real.sh << 'EOF'\necho hi > phantom.txt\ndata | tee ghost.log\nEOF"
+    assert cm.detect_bash_write_targets(cmd) == [("real.sh", 2)]
+
+
+def test_redirect_after_heredoc_still_detected():
+    cmd = "cat > real.txt << 'EOF'\nbody\nEOF\necho done > after.txt"
+    targets = cm.detect_bash_write_targets(cmd)
+    assert ("real.txt", 1) in targets
+    assert ("after.txt", None) in targets
+
+
+# ---------------------------------------------------------------------------
+# escalate_config — the overflow-recovery ladder
+# ---------------------------------------------------------------------------
+
+
+def test_escalate_config_level_zero_is_identity():
+    config = cm.CompactionConfig()
+    assert cm.escalate_config(config, 0) is config
+
+
+def test_escalate_config_levels_are_monotonically_harsher():
+    base = cm.CompactionConfig()
+    l1 = cm.escalate_config(base, 1)
+    l2 = cm.escalate_config(base, 2)
+    assert l1.max_tool_output_tokens < base.max_tool_output_tokens
+    assert l2.max_tool_output_tokens < l1.max_tool_output_tokens
+    assert l1.stale_output_keep_turns is not None
+    assert l2.stale_output_keep_turns < l1.stale_output_keep_turns
+    assert l2.write_recency_keep == 0
+    # levels beyond MAX clamp to the harshest config
+    assert cm.escalate_config(base, 5) == l2
+    # base config is never mutated
+    assert base.max_tool_output_tokens == 2000 and base.stale_output_keep_turns is None
+
+
+# ---------------------------------------------------------------------------
+# estimate_messages_tokens — must see tool-call arguments (measured: heredoc
+# arguments, not tool output, dominated real overflowing trajectories).
+# ---------------------------------------------------------------------------
+
+
+def test_estimate_counts_tool_call_arguments():
+    small = [{"role": "user", "content": "hi"}]
+    with_args = small + [_assistant_bash("c1", "cat > f << 'EOF'\n" + "x" * 8000 + "\nEOF")]
+    assert cm.estimate_messages_tokens(with_args, None) > cm.estimate_messages_tokens(small, None) + 1500
