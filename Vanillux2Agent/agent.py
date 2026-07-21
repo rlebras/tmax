@@ -4,6 +4,15 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (task_reanchor) adds PERIODIC TASK RE-ANCHORING and nothing
+else, so an A/B against the replicate baseline isolates its effect: the
+task statement sits in the very first message and, on long runs, drifts tens
+of thousands of tokens behind the model's recent context — on the 444-run
+baseline, wrong-submits run LONGER than right ones (median 32 vs 26 steps),
+consistent with requirement drift. Every ``reanchor_every`` completed steps
+the harness re-injects a compact verbatim excerpt of the task statement as
+a user message.
 """
 
 from __future__ import annotations
@@ -86,8 +95,18 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        reanchor_every: int = 16,
+        reanchor_excerpt_chars: int = 2000,
         **kwargs: Any,
     ) -> None:
+        """
+        reanchor_every: re-inject a compact excerpt of the task statement
+            every this many steps (0 disables). 16 keeps the reminder inside
+            the model's recent-attention window on 27+-step runs without
+            meaningfully inflating the context.
+        reanchor_excerpt_chars: how much of the task statement each reminder
+            re-shows verbatim.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +118,8 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.reanchor_every = reanchor_every
+        self.reanchor_excerpt_chars = reanchor_excerpt_chars
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -133,6 +154,7 @@ class Vanillux2Agent(BaseAgent):
             "reasoning_tokens": 0,
         }
         format_errors = 0
+        reanchors_sent = 0
 
         try:
             for step in range(self.max_steps):
@@ -145,6 +167,25 @@ class Vanillux2Agent(BaseAgent):
                         self.cost_limit,
                     )
                     break
+
+                if self.reanchor_every and step > 0 and step % self.reanchor_every == 0:
+                    reanchors_sent += 1
+                    excerpt = instruction.strip()[: self.reanchor_excerpt_chars]
+                    if len(instruction.strip()) > self.reanchor_excerpt_chars:
+                        excerpt += "\n[... excerpt truncated; the full statement is in the first user message]"
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"(harness) Reminder after {step} steps — the task you are "
+                                "solving, verbatim:\n\n--- TASK STATEMENT ---\n"
+                                f"{excerpt}\n\n"
+                                "Check your current direction against it: deliver exactly what it "
+                                "asks (exact paths, names, formats), nothing else."
+                            ),
+                        }
+                    )
+                    timing_log.append({"step": step + 1, "task_reanchor": True})
 
                 t0 = time.monotonic()
                 try:
@@ -232,6 +273,7 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            context.metadata = {"task_reanchor": {"sent": reanchors_sent}}
 
     async def _query_with_retry(
         self, model: str, messages: list[dict[str, Any]]
