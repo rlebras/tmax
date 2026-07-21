@@ -4,6 +4,15 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (obs_cap_tight) TIGHTENS OBSERVATION TRUNCATION and nothing
+else, so an A/B against the replicate baseline isolates its effect: 143 of
+444 baseline runs kept at least one observation truncated at the default
+10 000-char / 5 000+5 000 head/tail cap, and with no context management on
+the plain agent every one of those stays in context for the rest of the
+run — feeding the 38% context-overflow bucket. Here each observation is
+capped at ``obs_max_chars`` (default 3 000, head/tail 1 500) with a hint to
+re-fetch selectively via head/tail/sed if more is needed.
 """
 
 from __future__ import annotations
@@ -86,8 +95,18 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        obs_max_chars: int = 3000,
+        obs_head_chars: int = 1500,
+        obs_tail_chars: int = 1500,
         **kwargs: Any,
     ) -> None:
+        """
+        obs_max_chars / obs_head_chars / obs_tail_chars: per-observation
+            truncation caps (override the vanillux prompt defaults of
+            10000/5000/5000). An observation longer than obs_max_chars is
+            reduced to its head + tail with a re-fetch hint in between, so
+            long command output doesn't permanently bloat the context.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +118,9 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.obs_max_chars = obs_max_chars
+        self.obs_head_chars = obs_head_chars
+        self.obs_tail_chars = obs_tail_chars
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -333,12 +355,32 @@ class Vanillux2Agent(BaseAgent):
             timeout_sec=self.command_timeout,
         )
 
-    @staticmethod
-    def _format_tool_result(result: Any) -> str:
+    def _truncate_obs(self, output: str) -> str:
+        """Tighter head/tail truncation than the vanillux default, driven by
+        this agent's obs_* caps. Falls back to the module default when the
+        caps are left at their sentinel of 0 (feature disabled)."""
+        if not self.obs_max_chars:
+            return _truncate_observation(output)
+        if len(output) <= self.obs_max_chars:
+            return output
+        head_n, tail_n = self.obs_head_chars, self.obs_tail_chars
+        elided = len(output) - head_n - tail_n
+        return (
+            "The output of your last command was too long and has been truncated. "
+            "Re-run with head/tail/sed/grep to see a smaller, targeted slice if you "
+            "need more.\n\n"
+            f"---- HEAD ({head_n} chars) ----\n"
+            f"{output[:head_n]}\n"
+            f"---- {elided} chars elided ----\n"
+            f"---- TAIL ({tail_n} chars) ----\n"
+            f"{output[-tail_n:]}"
+        )
+
+    def _format_tool_result(self, result: Any) -> str:
         output = result.stdout or ""
         if result.stderr:
             output += f"\n{result.stderr}" if output else result.stderr
         output = _COMPOSE_PROVIDER_RE.sub("", output)
         output = _DOCKER_EXEC_ERROR_RE.sub("", output).rstrip()
-        truncated = _truncate_observation(output) if output else "(no output)"
+        truncated = self._truncate_obs(output) if output else "(no output)"
         return f"{truncated}\n\n(exit_code={result.return_code})"
