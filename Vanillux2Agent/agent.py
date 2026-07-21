@@ -4,6 +4,15 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (steps_budget_nudges) adds STEP-BUDGET AWARENESS and nothing
+else, so an A/B against the replicate baseline isolates its effect: models
+get no signal about the 64-step cap and routinely run out mid-exploration
+or mid-fix — the harness now injects a one-time prioritize warning when
+``steps_warning_early`` steps remain, and a finalize-and-submit-now warning
+at ``steps_warning_final``. Unsubmitted runs pass at 1.7% vs 49% for
+submitted ones on the measured baseline, so converting step-exhausted runs
+into submitted ones is nearly free reward.
 """
 
 from __future__ import annotations
@@ -86,8 +95,18 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        steps_warning_early: int = 10,
+        steps_warning_final: int = 2,
         **kwargs: Any,
     ) -> None:
+        """
+        Step-budget nudges (see the module docstring):
+
+        steps_warning_early: when this many steps remain, inject a one-time
+            "prioritize and start wrapping up" warning (0 disables).
+        steps_warning_final: when this many steps remain, inject a one-time
+            "save your work and submit NOW" warning (0 disables).
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +118,8 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.steps_warning_early = steps_warning_early
+        self.steps_warning_final = steps_warning_final
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -133,6 +154,7 @@ class Vanillux2Agent(BaseAgent):
             "reasoning_tokens": 0,
         }
         format_errors = 0
+        steps_warnings_fired: list[int] = []
 
         try:
             for step in range(self.max_steps):
@@ -145,6 +167,39 @@ class Vanillux2Agent(BaseAgent):
                         self.cost_limit,
                     )
                     break
+
+                # Step-budget nudges: `remaining` strictly decreases by one
+                # per iteration, so each equality fires at most once. Both
+                # are user-role messages appended before this step's LLM
+                # call, so they shape the very next decision.
+                remaining = self.max_steps - step
+                if self.steps_warning_early and remaining == self.steps_warning_early:
+                    steps_warnings_fired.append(remaining)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"(harness) Only {remaining} steps remain in your budget. "
+                                "Prioritize: get the core requirement working and saved to its "
+                                "deliverable file(s) first, verify it, and stop pursuing "
+                                "side-issues. An unfinished exploration scores nothing."
+                            ),
+                        }
+                    )
+                elif self.steps_warning_final and remaining == self.steps_warning_final:
+                    steps_warnings_fired.append(remaining)
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"(harness) FINAL WARNING: {remaining} steps left. STOP exploring. "
+                                "Make sure your best current solution is saved to its deliverable "
+                                "file(s) on this step, then submit with "
+                                "`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` — an unsubmitted "
+                                "run almost always scores zero."
+                            ),
+                        }
+                    )
 
                 t0 = time.monotonic()
                 try:
@@ -232,6 +287,7 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            context.metadata = {"steps_nudges": {"fired_at_remaining": steps_warnings_fired}}
 
     async def _query_with_retry(
         self, model: str, messages: list[dict[str, Any]]
