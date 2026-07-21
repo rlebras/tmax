@@ -4,6 +4,16 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (low_temp) LOWERS THE SAMPLING TEMPERATURE (0.7 -> 0.2) and
+tightens top_p (0.95 -> 0.9), and nothing else, so an A/B against the
+replicate baseline isolates the reliability-vs-diversity tradeoff. The
+per-task pass distribution on the 444-run baseline is bimodal — of 89
+tasks, 52 never solve and 16 solve all 5, but 14 solve 1-4/5 (12 of them
+exactly 1/5), i.e. high-variance near-misses where individual attempts
+drift into avoidable mistakes. Lower temperature trades cross-attempt
+diversity for steadier single-attempt execution; whether that nets out
+positive at k=5 is the empirical question this arm answers.
 """
 
 from __future__ import annotations
@@ -77,8 +87,8 @@ class Vanillux2Agent(BaseAgent):
         logs_dir: Path,
         model_name: str | None = None,
         max_steps: int = 64,
-        temperature: float = 0.7,
-        top_p: float | None = 0.95,
+        temperature: float = 0.2,
+        top_p: float | None = 0.9,
         top_k: int | None = None,
         max_tokens: int = 16384,
         cost_limit: float = 0.0,
