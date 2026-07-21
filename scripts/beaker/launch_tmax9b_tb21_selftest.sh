@@ -47,4 +47,4 @@ cd "$REPO_ROOT"
     --cluster ai2/jupiter \
     --priority high \
     --budget ai2/oe-omai \
-    --repo-ref 01776cdb
+    --repo-ref 01776cdb08a7cf265ad2ae73395d15ecdeeada26
