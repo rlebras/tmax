@@ -108,3 +108,42 @@ format_error_template: |
   Please always provide EXACTLY ONE call to the `bash` tool. If you want to
   end the task, please issue the command `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
   via the `bash` tool, with no other content in the command.
+
+# ---------------------------------------------------------------------------
+# Prompt-only self-verification addendum — used only by Vanillux2Agent when
+# enable_self_verify_prompt is True. A NEW, additive key appended to the
+# instance template, never replacing it. This is the TEACHING half of the
+# self-test gate (see the self_test_only branch) with NO enforcement: no
+# intercepted commands, no submit gate — an ablation isolating whether
+# telling the model how to verify moves the needle without the harness
+# machinery. A failure analysis of 445 runs found 67% of wrong-but-submitted
+# solutions declared success without a real check, and the checks that did
+# exist were usually circular (always-exit-0 patterns).
+self_verify_instance_addendum: |
+
+  ## Verify before you submit (required)
+
+  Most wrong submissions declare success without ever running a real check.
+  Before submitting:
+
+  1. Derive at least 2 testable acceptance criteria from the task statement
+     (turn any example input/output into a known-answer test first), and
+     note which file(s) are your actual deliverable.
+  2. Verify each criterion with a command that EXITS NON-ZERO on failure —
+     nothing else counts as verification, so a command that can't fail is
+     worthless regardless of what it prints:
+       BAD:  `python3 -c "print(a == b)"` (prints True/False, always exits 0)
+       BAD:  `cmd && echo PASS || echo FAIL` (`echo` never fails, always exits 0)
+       GOOD: `python3 -c "assert a == b"` — or `test "$a" = "$b"`
+     Use an independent oracle, not a comparison of the program to itself:
+       - known-answer: `test "$(./solve input.txt)" = "42"` (a fixed value,
+         e.g. from the task's own example I/O)
+       - differential: `diff <(./solve.sh) <(python3 reference.py)` (two
+         independently-derived results)
+       - property/invariant: something that must structurally hold (round
+         trip, idempotence) rather than one hard-coded value
+     Existence-only checks (`test -f out.txt`) prove nothing about behavior.
+     Beware of checks that only pass because of leftover scratch files —
+     verify against the exact file(s) you are actually delivering.
+  3. If a check fails, fix the SOLUTION, not the check. Only submit once
+     every criterion passes.

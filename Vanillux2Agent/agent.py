@@ -4,6 +4,13 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (prompt_self_verify) adds a PROMPT-ONLY VERIFICATION addendum
+and nothing else: the teaching half of the self-test gate (derive criteria
+from the task, verify with commands that exit non-zero on failure, use
+independent oracles, fix the solution not the check) with NO enforcement —
+no intercepted commands, no submit gate. An A/B against the replicate
+baseline and the self_test_only arm isolates teaching from enforcement.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from rl_data.generator.sample_solutions import (
 from rl_data.generator.vanillux_solver import (
     _format_error_message,
     _render_instance,
+    _SELF_VERIFY_INSTANCE_ADDENDUM,
     _SYSTEM_TEMPLATE,
     _truncate_observation,
 )
@@ -86,8 +94,14 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        enable_self_verify_prompt: bool = True,
         **kwargs: Any,
     ) -> None:
+        """
+        enable_self_verify_prompt: append the verify-before-you-submit
+            addendum (see the module docstring) to the instance prompt.
+            Prompt-only — there is no enforcement mechanism on this branch.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +113,7 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.enable_self_verify_prompt = enable_self_verify_prompt
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -120,9 +135,12 @@ class Vanillux2Agent(BaseAgent):
         context: AgentContext,
     ) -> None:
         model = self.model_name or "anthropic/claude-haiku-4-5"
+        rendered_instance = _render_instance(instruction.strip())
+        if self.enable_self_verify_prompt:
+            rendered_instance = f"{rendered_instance}\n{_SELF_VERIFY_INSTANCE_ADDENDUM}"
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": _SYSTEM_TEMPLATE},
-            {"role": "user", "content": _render_instance(instruction.strip())},
+            {"role": "user", "content": rendered_instance},
         ]
 
         timing_log: list[dict[str, Any]] = []
