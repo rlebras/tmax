@@ -4,6 +4,17 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (submit_reflection) adds a PRE-SUBMIT REFLECTION TURN and
+nothing else, so an A/B against the replicate baseline isolates its effect:
+of runs that finish and submit a wrong solution, 67% explicitly declare
+success — and wrong-submits run LONGER than right ones (median 32 vs 26
+steps), consistent with the original requirements drifting out of focus.
+The FIRST submit attempt is intercepted and answered with a verbatim
+excerpt of the task statement plus an instruction to confirm each explicit
+requirement is met; the next submit goes through unconditionally. One extra
+step per run, no checks, no gate — the cheapest possible "re-read the task
+before declaring victory".
 """
 
 from __future__ import annotations
@@ -86,8 +97,18 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        enable_submit_reflection: bool = True,
+        reflection_task_excerpt_chars: int = 4000,
         **kwargs: Any,
     ) -> None:
+        """
+        enable_submit_reflection: intercept the FIRST submit attempt and
+            answer it with the task statement plus a confirm-each-requirement
+            instruction; the next submit is honored unconditionally (bounded
+            to exactly one extra step per run).
+        reflection_task_excerpt_chars: how much of the task statement to
+            re-show verbatim in that reflection turn.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +120,8 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.enable_submit_reflection = enable_submit_reflection
+        self.reflection_task_excerpt_chars = reflection_task_excerpt_chars
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -133,6 +156,7 @@ class Vanillux2Agent(BaseAgent):
             "reasoning_tokens": 0,
         }
         format_errors = 0
+        reflection_done = False
 
         try:
             for step in range(self.max_steps):
@@ -185,6 +209,44 @@ class Vanillux2Agent(BaseAgent):
                 command = action.get("command") or ""
                 tool_call_id = action.get("tool_call_id") or ""
 
+                # Pre-submit reflection: intercept the FIRST submit attempt
+                # BEFORE the sentinel command runs (so the marker never
+                # enters the log), re-show the task, and ask the model to
+                # confirm each requirement. The next submit goes through
+                # unconditionally — this costs exactly one step.
+                if (
+                    self.enable_submit_reflection
+                    and action["type"] == "done"
+                    and not reflection_done
+                ):
+                    reflection_done = True
+                    excerpt = instruction.strip()[: self.reflection_task_excerpt_chars]
+                    if len(instruction.strip()) > self.reflection_task_excerpt_chars:
+                        excerpt += "\n[... task statement truncated; the full text is in the first user message]"
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": (
+                                "(harness) Hold on — before your submission is accepted, re-read "
+                                "the task statement below and confirm each EXPLICIT requirement is "
+                                "actually met: files at their exact paths and names, exact output "
+                                "formats, every listed behavior. If anything is missing or "
+                                "unverified, fix it first. When you are confident, submit again "
+                                "and it will be accepted.\n\n--- TASK STATEMENT ---\n"
+                                f"{excerpt}"
+                            ),
+                        }
+                    )
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "submit_reflection": True,
+                        }
+                    )
+                    continue
+
                 t1 = time.monotonic()
                 result = await self._execute_bash(command, environment)
                 exec_time = time.monotonic() - t1
@@ -232,6 +294,7 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            context.metadata = {"submit_reflection": {"triggered": reflection_done}}
 
     async def _query_with_retry(
         self, model: str, messages: list[dict[str, Any]]
