@@ -4,6 +4,13 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (stuck_loop_breaker) adds THRASH DETECTION and nothing else, so
+an A/B against the replicate baseline isolates its effect: when the model
+re-runs the same command back to back, or strings together a long streak of
+failing commands, the harness injects a one-time corrective nudge ("re-read
+the error, change approach") instead of letting the loop burn the step
+budget. Nudges are bounded per run; a successful command resets the streak.
 """
 
 from __future__ import annotations
@@ -86,8 +93,21 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        stuck_repeat_threshold: int = 3,
+        stuck_failure_streak: int = 6,
+        max_stuck_nudges: int = 3,
         **kwargs: Any,
     ) -> None:
+        """
+        Thrash-detection flags (see the module docstring):
+
+        stuck_repeat_threshold: nudge after the same bash command has run
+            this many times back to back (0 disables).
+        stuck_failure_streak: nudge after this many consecutive commands
+            exited non-zero (0 disables). Any success resets the streak.
+        max_stuck_nudges: total nudges per run across both detectors —
+            a model that ignores them shouldn't drown in repeats of them.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +119,9 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.stuck_repeat_threshold = stuck_repeat_threshold
+        self.stuck_failure_streak = stuck_failure_streak
+        self.max_stuck_nudges = max_stuck_nudges
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -133,6 +156,10 @@ class Vanillux2Agent(BaseAgent):
             "reasoning_tokens": 0,
         }
         format_errors = 0
+        last_command = ""
+        repeat_count = 0
+        failure_streak = 0
+        stuck_nudges_sent = 0
 
         try:
             for step in range(self.max_steps):
@@ -210,6 +237,45 @@ class Vanillux2Agent(BaseAgent):
 
                 if action["type"] == "done" or SUBMIT_MARKER in tool_content:
                     break
+
+                # Thrash detection — appended AFTER the tool result so the
+                # nudge reads as commentary on what just happened.
+                if command.strip() == last_command:
+                    repeat_count += 1
+                else:
+                    last_command = command.strip()
+                    repeat_count = 1
+                failure_streak = failure_streak + 1 if result.return_code != 0 else 0
+
+                nudge = None
+                if (
+                    self.stuck_repeat_threshold
+                    and repeat_count >= self.stuck_repeat_threshold
+                    and stuck_nudges_sent < self.max_stuck_nudges
+                ):
+                    nudge = (
+                        f"(harness) You have now run the SAME command {repeat_count} times in a "
+                        "row. Re-running it will not change the outcome. Re-read the last error "
+                        "carefully, form a different hypothesis about the cause, and try a "
+                        "DIFFERENT approach."
+                    )
+                    repeat_count = 0
+                elif (
+                    self.stuck_failure_streak
+                    and failure_streak >= self.stuck_failure_streak
+                    and stuck_nudges_sent < self.max_stuck_nudges
+                ):
+                    nudge = (
+                        f"(harness) The last {failure_streak} commands all exited non-zero. "
+                        "Step back before continuing: re-read the task statement and the FIRST "
+                        "error in this chain (later ones are usually fallout), then consider an "
+                        "alternative approach rather than another incremental retry."
+                    )
+                    failure_streak = 0
+                if nudge:
+                    stuck_nudges_sent += 1
+                    messages.append({"role": "user", "content": nudge})
+                    timing_log.append({"step": step + 1, "stuck_nudge": True})
         finally:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
             (self.logs_dir / "trajectory.json").write_text(
@@ -232,6 +298,7 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            context.metadata = {"stuck_nudges": {"sent": stuck_nudges_sent}}
 
     async def _query_with_retry(
         self, model: str, messages: list[dict[str, Any]]
