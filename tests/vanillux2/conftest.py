@@ -1,94 +1,93 @@
-"""Shared fixtures for the self-test gate tests.
+"""Test fixtures for context_management.py / edit_tools.py.
 
-``FakeEnvironment`` duck-types ``harbor.environments.base.BaseEnvironment``'s
-``exec()`` (the only method the self-test gate + the baseline bash loop
-call) as a real subprocess against a temp directory — our test "container"
-*is* the local filesystem, so a remote path is just a real path on disk. This
-exercises the actual commands (mkdir/cp/cat/heredocs) the gate generates,
-without needing Docker.
+These two modules (plus container_ops.py) are imported by *bare* module name
+(not ``Vanillux2Agent.context_management``) by inserting ``Vanillux2Agent/``
+onto ``sys.path`` below. That's deliberate: going through the
+``Vanillux2Agent`` package would execute ``Vanillux2Agent/__init__.py``,
+which imports ``agent.py``, which imports ``harbor`` — a heavy dependency
+with native extensions that isn't needed to exercise the pure
+compaction/edit-tool logic these tests cover, and may not be installed in
+every dev environment.
+
+``ops.exec_fn`` runs real bash against a temp directory rather than mocking
+the shell. ``ops.upload_bytes``/``download_bytes`` simulate harbor's
+``environment.upload_file``/``download_file`` (``docker cp``) as plain local
+file writes/reads against that same temp directory — our test "container"
+*is* the local filesystem, so a remote path is just a real path on disk.
+This exercises the actual commands/paths these modules generate end to end.
 """
 
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
+_VANILLUX2_DIR = Path(__file__).resolve().parents[2] / "Vanillux2Agent"
+if str(_VANILLUX2_DIR) not in sys.path:
+    sys.path.insert(0, str(_VANILLUX2_DIR))
+
+from container_ops import ContainerOps  # noqa: E402
+
 
 @dataclass
 class FakeExecResult:
-    """Duck-types harbor.environments.base.ExecResult."""
+    """Duck-types harbor.environments.base.ExecResult without importing harbor."""
 
     stdout: str | None = None
     stderr: str | None = None
     return_code: int = 0
 
 
-class FakeEnvironment:
-    """Runs commands as real subprocesses against a temp dir standing in for a container."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-
-    async def exec(
-        self,
-        command: str,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        timeout_sec: int | None = None,
-        user: str | int | None = None,
-    ) -> FakeExecResult:
-        workdir = cwd or str(self.root)
-        Path(workdir).mkdir(parents=True, exist_ok=True)
+def make_exec_fn(cwd: Path):
+    async def exec_fn(command: str) -> FakeExecResult:
         proc = await asyncio.create_subprocess_shell(
             command,
-            cwd=workdir,
+            cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_sec or 30
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return FakeExecResult(stdout="", stderr="timed out", return_code=124)
+        stdout_b, stderr_b = await proc.communicate()
         return FakeExecResult(
             stdout=stdout_b.decode("utf-8", errors="replace"),
             stderr=stderr_b.decode("utf-8", errors="replace"),
             return_code=proc.returncode or 0,
         )
 
-
-@pytest.fixture
-def fake_env(tmp_path):
-    root = tmp_path / "container_root"
-    root.mkdir()
-    return FakeEnvironment(root)
+    return exec_fn
 
 
-def make_session_exec(environment: FakeEnvironment):
-    async def _exec(command: str):
-        return await environment.exec(command)
+def make_ops(cwd: Path) -> ContainerOps:
+    exec_fn = make_exec_fn(cwd)
 
-    return _exec
+    async def upload_bytes(content: bytes, remote_path: str) -> None:
+        # Mirrors `docker cp`: writes exact bytes, does NOT create missing
+        # parent directories (Path.write_bytes raises FileNotFoundError for
+        # those, same as a real `docker cp` into a nonexistent directory).
+        Path(remote_path).write_bytes(content)
 
+    async def download_bytes(remote_path: str) -> bytes:
+        p = Path(remote_path)
+        if not p.is_file():
+            raise FileNotFoundError(remote_path)
+        return p.read_bytes()
 
-def make_isolated_exec(environment: FakeEnvironment):
-    async def _exec(command: str, cwd: str):
-        return await environment.exec(command, cwd=cwd)
-
-    return _exec
-
-
-@pytest.fixture
-def session_exec(fake_env):
-    return make_session_exec(fake_env)
+    return ContainerOps(exec_fn=exec_fn, upload_bytes=upload_bytes, download_bytes=download_bytes)
 
 
 @pytest.fixture
-def isolated_exec(fake_env):
-    return make_isolated_exec(fake_env)
+def workdir(tmp_path):
+    return tmp_path
+
+
+@pytest.fixture
+def exec_fn(tmp_path):
+    return make_exec_fn(tmp_path)
+
+
+@pytest.fixture
+def ops(tmp_path):
+    return make_ops(tmp_path)

@@ -91,6 +91,13 @@ _INSTANCE_TEMPLATE: str = _VANILLUX_PROMPTS["instance_template"]
 _OBS_CFG: Dict[str, Any] = _VANILLUX_PROMPTS["observation"]
 _FORMAT_ERROR_TEMPLATE: str = _VANILLUX_PROMPTS["format_error_template"]
 
+# Multi-tool variants (Vanillux2Agent with enable_edit_tools=True only — see
+# the comment above these keys in vanillux_prompts.yaml). The bash-only
+# names above are unchanged and keep driving run_n_solutions_vanillux below.
+_SYSTEM_TEMPLATE_MULTI_TOOL: str = _VANILLUX_PROMPTS["system_template_multi_tool"]
+_INSTANCE_TEMPLATE_MULTI_TOOL: str = _VANILLUX_PROMPTS["instance_template_multi_tool"]
+_FORMAT_ERROR_TEMPLATE_MULTI_TOOL: str = _VANILLUX_PROMPTS["format_error_template_multi_tool"]
+
 
 def _render_instance(task: str) -> str:
     """Render the vanillux instance template with the task description.
@@ -99,6 +106,14 @@ def _render_instance(task: str) -> str:
     substitute literally rather than pulling in Jinja2 to keep deps light.
     """
     return _INSTANCE_TEMPLATE.replace("{{task}}", task)
+
+
+def _render_instance_multi_tool(task: str) -> str:
+    return _INSTANCE_TEMPLATE_MULTI_TOOL.replace("{{task}}", task)
+
+
+def _format_error_message_multi_tool(error: str) -> str:
+    return _FORMAT_ERROR_TEMPLATE_MULTI_TOOL.replace("{{error}}", error)
 
 
 def _truncate_observation(output: str) -> str:
