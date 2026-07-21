@@ -137,6 +137,15 @@ structured tool-calls** (it reads the `command` argument out of
   edits never need to put a whole file back into the conversation. See
   [`vanillux2_context_management.md`](vanillux2_context_management.md) for
   the full design, config flags, and measured token savings.
+- **Self-test gate:** the submit marker is honored only once the model has
+  declared acceptance criteria and every one of them has a check that passed
+  against an *isolated copy of its declared deliverables* (leftover scratch
+  state and quietly-weakened files can't fake a pass). Circular/trivial
+  checks are detected and don't count; rejections are bounded so a stuck
+  model still finishes with a flagged submit. Via `declare_criteria`/
+  `run_check` tools when edit tools are on, or an intercepted
+  `agent-check <id> -- <command>` bash convention on the bash-only contract.
+  See [`vanillux2_self_test_gate.md`](vanillux2_self_test_gate.md).
 
 This is the recommended agent on harbor 0.6.6 when you want the mini-swe-agent
 recipe but a host-side loop you control. See the prior writeup in

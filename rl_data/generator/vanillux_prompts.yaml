@@ -220,3 +220,106 @@ format_error_template_multi_tool: |
   `insert`, `create`, or `read`), preceded by a THOUGHT. If you want to end
   the task, please issue the command `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
   via the `bash` tool, with no other content in the command.
+
+# ---------------------------------------------------------------------------
+# Self-test gate addenda — used only by Vanillux2Agent when
+# enable_self_test_gate is True (see Vanillux2Agent/self_test.py). NEW,
+# additive keys: appended to whichever system/instance template above is
+# selected, never replacing them. A failure analysis of 445 runs found most
+# wrong-but-submitted solutions declared success without ever running an
+# independent check against the task's stated criteria — these addenda, plus
+# the submit gate in agent.py, are the harness-side fix. The `_bash` variant
+# is for the bash-only contract (enable_edit_tools=False), where the model
+# gets an intercepted `agent-check` command convention instead of real
+# declare_criteria/run_check tools. {{min_criteria}} and {{criteria_path}}
+# are filled in by agent.py from the live config.
+self_test_system_addendum: |
+  You also have two tools for verifying your own work before you submit:
+  - `declare_criteria`: declare the testable acceptance criteria for this
+    task (each a `{id, description, how_to_check}` triple), plus which
+    file(s) are your deliverable. Call this once, early.
+  - `run_check`: verify one declared criterion by running a command. Checks
+    run against an ISOLATED copy of your declared deliverables, not your
+    live scratch state — a check that only passes because of leftover
+    files, a stray helper, or a weakened deliverable will FAIL there even
+    if it looked fine when you ran it yourself.
+
+  Your final submit (`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`) is
+  REJECTED until every declared criterion has a passing isolated check.
+  Declaring criteria and using `run_check` is how your work gets verified —
+  it is not optional.
+
+self_test_instance_addendum: |
+
+  ## Verifying your own work
+
+  Before you can submit, you must:
+  1. Call `declare_criteria` with at least {{min_criteria}} testable
+     acceptance criteria and your deliverable file(s). If the task statement
+     includes example input/output, turn those into criteria first. Only
+     declared deliverables are copied into the isolated sandbox each check
+     runs in — scratch files and test helpers won't be there.
+  2. For each criterion, call `run_check(criterion_id, command, expected)`.
+     A check passes iff `command` EXITS non-zero on failure (or, with
+     `expected` given, iff its output equals that fixed literal value) — a
+     command that can't fail is worthless regardless of what it prints:
+       BAD:  `python3 -c "print(a == b)"` (prints True/False, always exits 0)
+       BAD:  `cmd && echo PASS || echo FAIL` (`echo` never fails, always exits 0)
+       GOOD: `python3 -c "assert a == b"` — or `test "$a" = "$b"`
+     Use an independent oracle, not a comparison of the program to itself:
+       - known-answer: `expected="42"` with a fixed value, e.g. from the
+         task's own example I/O
+       - differential: `diff <(./solve.sh) <(python3 reference.py)` (two
+         independently-derived results)
+       - property/invariant: something that must structurally hold (round
+         trip, idempotence) rather than one hard-coded value
+     Existence-only checks (`test -f out.txt`) don't count — verify content
+     or behavior.
+  3. Fix and re-check anything that fails. `run_check` reports pass/fail
+     plus the first failing line, not full output — use `bash`/`read` to dig
+     further if a check fails.
+
+  Submitting is gated: it will be rejected, with a compact list of what's
+  unmet, until every declared criterion has a passing isolated check. After
+  a few rejected attempts you may submit anyway, but a submission with
+  failing checks is recorded as such.
+
+self_test_format_error_addendum: |
+
+  You may also call `declare_criteria` or `run_check` instead of `bash`.
+
+self_test_instance_addendum_bash: |
+
+  ## Self-testing (required before submit)
+
+  Verify your work against the task's own acceptance criteria before
+  submitting:
+
+  1. Early on, write at least {{min_criteria}} testable criteria (turn any
+     example input/output into one) as JSON to `{{criteria_path}}`:
+     `{"criteria": [{"id": "short_id", "description": "...", "how_to_check": "..."}], "deliverables": ["path/to/solution/file", ...]}`
+     `deliverables` lists your solution file(s) — only these are copied into
+     each isolated check; scratch files/helpers won't be there.
+  2. Verify each criterion with `agent-check <id> -- <command>` — a harness
+     convention, not a real binary, so don't bother checking with `which`/
+     `type`/`command -v` first (it will correctly report "not found" — that's
+     expected, just run it). It must be on its own LINE (it can share a bash
+     call with setup on OTHER lines, but not chained with `&&`/`;` on the SAME
+     line). It passes iff `<command>` EXITS non-zero on failure — nothing else
+     is checked, so a command that can't fail is worthless regardless of what
+     it looks like:
+       BAD:  `python3 -c "print(a == b)"` (prints True/False, always exits 0)
+       BAD:  `cmd && echo PASS || echo FAIL` (`echo` never fails, always exits 0)
+       GOOD: `python3 -c "assert a == b"` — or `test "$a" = "$b"`
+     Use an independent oracle, not a comparison of the program to itself:
+       - known-answer: `test "$(./solve input.txt)" = "42"` (a fixed value,
+       e.g. from the task's own example I/O)
+       - differential: `diff <(./solve.sh) <(python3 reference.py)` (two
+         independently-derived results)
+       - property/invariant: something that must structurally hold (round
+         trip, idempotence) rather than one hard-coded value
+     It also re-runs `<command>` against an ISOLATED copy of your
+     deliverables; only that result counts, so leftover files or a weakened
+     deliverable won't fake a pass.
+  3. Submit needs every declared criterion to have a passing `agent-check`,
+     or it's rejected with a compact list of what's unmet.

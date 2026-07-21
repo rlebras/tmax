@@ -12,6 +12,14 @@ compacted rebuild of it, produced fresh every step by
 the stubbing/truncation rules, and ``edit_tools.py`` for the optional
 str_replace/insert/create/apply_edits/read tools. Config flags for all of
 this are documented on ``Vanillux2Agent.__init__``.
+
+Self-test gate: ``self_test.py`` lets the model declare acceptance criteria
+and verify them against an isolated copy of its declared deliverables before
+the ``COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`` sentinel is honored — via the
+``declare_criteria``/``run_check`` tools when edit tools are on, or the
+intercepted ``agent-check <id> -- <command>`` bash convention when the
+contract is bash-only. See ``self_test.py``'s module docstring for the full
+mechanism and its documented isolation-scope limitation.
 """
 
 from __future__ import annotations
@@ -21,8 +29,11 @@ import json
 import logging
 import os
 import re
+import shlex
 import tempfile
 import time
+from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -37,11 +48,15 @@ from rl_data.generator.vanillux_solver import (
     _format_error_message_multi_tool,
     _render_instance,
     _render_instance_multi_tool,
+    _SELF_TEST_FORMAT_ERROR_ADDENDUM,
+    _SELF_TEST_INSTANCE_ADDENDUM,
+    _SELF_TEST_INSTANCE_ADDENDUM_BASH,
+    _SELF_TEST_SYSTEM_ADDENDUM,
     _SYSTEM_TEMPLATE,
     _SYSTEM_TEMPLATE_MULTI_TOOL,
 )
 
-from Vanillux2Agent import context_management, edit_tools
+from Vanillux2Agent import context_management, edit_tools, self_test
 from Vanillux2Agent.container_ops import ContainerOps
 
 os.environ.setdefault("OPENAI_API_KEY", "dummy")
@@ -106,6 +121,11 @@ class Vanillux2Agent(BaseAgent):
         max_tool_output_tokens: int = 2000,
         head_lines: int = 40,
         tail_lines: int = 40,
+        enable_self_test_gate: bool = True,
+        min_criteria: int = 2,
+        max_gate_rejections: int = 3,
+        self_test_check_timeout: int = 60,
+        self_test_isolation_mode: str = "tempdir",
         **kwargs: Any,
     ) -> None:
         """
@@ -123,6 +143,26 @@ class Vanillux2Agent(BaseAgent):
             (Feature 2).
         head_lines / tail_lines: how much of a truncated tool output to keep
             verbatim at each end.
+
+        Self-test gate flags (see self_test.py for the mechanism these drive):
+
+        enable_self_test_gate: gate the COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+            sentinel on isolated self-test coverage. With edit tools on, the
+            model gets real declare_criteria/run_check tools; with the
+            bash-only contract it gets the intercepted `agent-check` bash
+            convention instead (so the bash-only tool schema stays untouched).
+        min_criteria: at least this many declared criteria must be covered by
+            a passing isolated check before submit is allowed (and every
+            declared criterion must be covered).
+        max_gate_rejections: after this many rejected submit attempts, submit
+            is allowed anyway (bounds the downside of a model stuck failing
+            its own checks) and ``submitted_with_failing_checks`` is recorded
+            in ``context.metadata``.
+        self_test_check_timeout: per-check timeout for the isolated run.
+        self_test_isolation_mode: only "tempdir" (fresh temp dir + fresh
+            process, populated with only the declared deliverables) is
+            currently implemented; see self_test.py's module docstring for
+            why a fresh container isn't available at this layer.
         """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
@@ -144,7 +184,25 @@ class Vanillux2Agent(BaseAgent):
             head_lines=head_lines,
             tail_lines=tail_lines,
         )
-        self._tool_schemas = TOOL_SCHEMAS + (edit_tools.EDIT_TOOL_SCHEMAS if enable_edit_tools else [])
+        self.enable_self_test_gate = enable_self_test_gate
+        if self_test_isolation_mode != "tempdir":
+            raise ValueError(f"unsupported self_test_isolation_mode: {self_test_isolation_mode!r}")
+        self._self_test_config = self_test.SelfTestConfig(
+            min_criteria=min_criteria,
+            max_gate_rejections=max_gate_rejections,
+            check_timeout_sec=self_test_check_timeout,
+            state_dir=f"{_STATE_DIR}/self_test",
+            isolation_mode=self_test_isolation_mode,
+        )
+        # Real tools need the multi-tool contract; on the bash-only contract
+        # the gate falls back to the intercepted agent-check convention so
+        # the RL-data-compatible bash-only schema stays untouched.
+        self._self_test_tools_enabled = enable_self_test_gate and enable_edit_tools
+        self._tool_schemas = (
+            TOOL_SCHEMAS
+            + (edit_tools.EDIT_TOOL_SCHEMAS if enable_edit_tools else [])
+            + (self_test.SELF_TEST_TOOL_SCHEMAS if self._self_test_tools_enabled else [])
+        )
 
     async def setup(self, environment: BaseEnvironment) -> None:
         if not self.persistent_bash:
@@ -167,12 +225,23 @@ class Vanillux2Agent(BaseAgent):
         model = self.model_name or "anthropic/claude-haiku-4-5"
         system_template = _SYSTEM_TEMPLATE_MULTI_TOOL if self.enable_edit_tools else _SYSTEM_TEMPLATE
         render_instance = _render_instance_multi_tool if self.enable_edit_tools else _render_instance
+        rendered_instance = render_instance(instruction.strip())
+        if self.enable_self_test_gate:
+            if self._self_test_tools_enabled:
+                system_template = f"{system_template}\n{_SELF_TEST_SYSTEM_ADDENDUM}"
+                instance_addendum = _SELF_TEST_INSTANCE_ADDENDUM
+            else:
+                instance_addendum = _SELF_TEST_INSTANCE_ADDENDUM_BASH
+            instance_addendum = instance_addendum.replace(
+                "{{min_criteria}}", str(self._self_test_config.min_criteria)
+            ).replace("{{criteria_path}}", self._self_test_config.criteria_path)
+            rendered_instance = f"{rendered_instance}\n{instance_addendum}"
         # The raw event log: append-only, never mutated, dumped verbatim to
         # trajectory.json. The model only ever sees a compacted rebuild of
         # this (see context_management.build_model_messages below).
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_template},
-            {"role": "user", "content": render_instance(instruction.strip())},
+            {"role": "user", "content": rendered_instance},
         ]
 
         timing_log: list[dict[str, Any]] = []
@@ -215,8 +284,18 @@ class Vanillux2Agent(BaseAgent):
 
         ops = ContainerOps(exec_fn=exec_fn, upload_bytes=upload_bytes, download_bytes=download_bytes)
 
+        async def isolated_exec(command: str, cwd: str) -> Any:
+            # Deliberately bypasses _wrap_command: no persistent cwd/env
+            # sourcing, no state-file updates — a genuinely fresh process per
+            # self_test.py's isolation contract (Mechanism 3).
+            return await environment.exec(
+                command=f"cd {shlex.quote(cwd)} && {command}",
+                timeout_sec=self._self_test_config.check_timeout_sec,
+            )
+
         spilled_indices: set[int] = set()
         compaction_stats = context_management.CompactionStats()
+        self_test_state = self_test.SelfTestState()
 
         try:
             for step in range(self.max_steps):
@@ -255,7 +334,12 @@ class Vanillux2Agent(BaseAgent):
                     pass
 
                 msg = response.choices[0].message.model_dump()
-                action = edit_tools.extract_action(msg)
+                action = edit_tools.extract_action(
+                    msg,
+                    extra_tool_names=self_test.SELF_TEST_TOOL_NAMES
+                    if self._self_test_tools_enabled
+                    else frozenset(),
+                )
                 if action["type"] == "no_tool_call":
                     msg.pop("tool_calls", None)
                     msg["content"] = msg.get("content") or ""
@@ -277,10 +361,134 @@ class Vanillux2Agent(BaseAgent):
                 messages.append(msg)
                 format_errors = 0
                 tool_call_id = action.get("tool_call_id") or ""
+                is_bash = action["name"] == "bash"
+                command = (action["args"].get("command") or "") if is_bash else ""
+
+                # Self-test interception of the bash stream (active in both
+                # contract modes when the gate is on): agent-check
+                # invocations, botched attempts, and existence probes are
+                # answered by the harness before they ever reach the shell.
+                if self.enable_self_test_gate and is_bash and action["type"] != "done":
+                    if self_test.looks_like_existence_probe(command):
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": self_test.AGENT_CHECK_EXISTENCE_HINT,
+                            }
+                        )
+                        timing_log.append(
+                            {
+                                "step": step + 1,
+                                "llm_s": round(llm_time, 1),
+                                "agent_check_existence_probe": True,
+                            }
+                        )
+                        continue
+
+                    checks: list[tuple[str, str]] = []
+                    remainder = ""
+                    whole = self_test.parse_agent_check(command)
+                    if whole is not None:
+                        checks = [whole]
+                    else:
+                        found = self_test.extract_agent_check_lines(command)
+                        if found is not None:
+                            checks, remainder = found
+
+                    if checks:
+                        t1 = time.monotonic()
+                        prefix = ""
+                        if remainder:
+                            if self_test.looks_like_malformed_agent_check(remainder):
+                                # e.g. a well-formed check alongside a botched
+                                # one on another line — don't let the botched
+                                # one hit the real shell as "command not found".
+                                prefix = self_test.AGENT_CHECK_SYNTAX_HINT + "\n\n"
+                            else:
+                                pre_result = await self._execute_bash(remainder, environment)
+                                prefix = self._format_tool_result(pre_result) + "\n\n"
+                        check_outputs = [
+                            await self_test.run_check(
+                                criterion_id,
+                                inner_command,
+                                None,
+                                state=self_test_state,
+                                config=self._self_test_config,
+                                ops=ops,
+                                isolated_exec=isolated_exec,
+                                step=step + 1,
+                            )
+                            for criterion_id, inner_command in checks
+                        ]
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": prefix + "\n\n".join(check_outputs),
+                            }
+                        )
+                        timing_log.append(
+                            {
+                                "step": step + 1,
+                                "llm_s": round(llm_time, 1),
+                                "bash_s": round(time.monotonic() - t1, 1),
+                                "agent_check": [cid for cid, _ in checks],
+                            }
+                        )
+                        continue
+
+                    if self_test.looks_like_malformed_agent_check(command):
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": self_test.AGENT_CHECK_SYNTAX_HINT,
+                            }
+                        )
+                        timing_log.append(
+                            {
+                                "step": step + 1,
+                                "llm_s": round(llm_time, 1),
+                                "agent_check_malformed": True,
+                            }
+                        )
+                        continue
+
+                # Explicit submit: gate BEFORE the sentinel command runs, so
+                # a rejected attempt costs no execution and the marker never
+                # enters the log to trip the finish condition below.
+                if action["type"] == "done" and self.enable_self_test_gate:
+                    criteria, _deliverables = await self_test.load_criteria(
+                        ops, self._self_test_config
+                    )
+                    gate = self_test.evaluate_gate(
+                        criteria, self_test_state, self._self_test_config
+                    )
+                    if not gate.allowed:
+                        self_test_state.gate_rejections += 1
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "content": self_test.gate_nudge(
+                                    gate, self._self_test_config, self._self_test_tools_enabled
+                                ),
+                            }
+                        )
+                        timing_log.append(
+                            {
+                                "step": step + 1,
+                                "llm_s": round(llm_time, 1),
+                                "gate_rejected": True,
+                            }
+                        )
+                        continue
+                    if gate.forced:
+                        self_test_state.submitted_with_failing_checks = True
 
                 t1 = time.monotonic()
-                if action["name"] == "bash":
-                    command = action["args"].get("command") or ""
+                if is_bash:
                     result = await self._execute_bash(command, environment)
                     exec_time = time.monotonic() - t1
                     tool_content = self._format_tool_result(result)
@@ -291,6 +499,25 @@ class Vanillux2Agent(BaseAgent):
                             "bash_s": round(exec_time, 1),
                             "return_code": result.return_code,
                             "cmd": command[:200],
+                        }
+                    )
+                elif self._self_test_tools_enabled and action["name"] in self_test.SELF_TEST_TOOL_NAMES:
+                    tool_content = await self_test.dispatch(
+                        action["name"],
+                        action["args"],
+                        state=self_test_state,
+                        ops=ops,
+                        isolated_exec=isolated_exec,
+                        config=self._self_test_config,
+                        step=step + 1,
+                    )
+                    exec_time = time.monotonic() - t1
+                    timing_log.append(
+                        {
+                            "step": step + 1,
+                            "llm_s": round(llm_time, 1),
+                            "tool_s": round(exec_time, 1),
+                            "tool": action["name"],
                         }
                     )
                 else:
@@ -305,6 +532,34 @@ class Vanillux2Agent(BaseAgent):
                         }
                     )
 
+                # A command can trip the submit sentinel by coincidence (its
+                # OUTPUT happens to contain the marker text) rather than by
+                # the model actually requesting the sentinel command — gate
+                # that path too, since it otherwise bypasses the explicit-
+                # submit gate above. Unlike that path, the command already
+                # ran, so a rejection appends the nudge to the (already-
+                # produced) output rather than replacing it.
+                is_implicit_submit = action["type"] != "done" and SUBMIT_MARKER in tool_content
+                if is_implicit_submit and self.enable_self_test_gate:
+                    criteria, _deliverables = await self_test.load_criteria(
+                        ops, self._self_test_config
+                    )
+                    gate = self_test.evaluate_gate(
+                        criteria, self_test_state, self._self_test_config
+                    )
+                    if not gate.allowed:
+                        self_test_state.gate_rejections += 1
+                        tool_content += (
+                            "\n\n(NOTE: this output happened to contain the submit marker text, "
+                            "but that alone does not finish the task.) "
+                            + self_test.gate_nudge(
+                                gate, self._self_test_config, self._self_test_tools_enabled
+                            )
+                        )
+                        is_implicit_submit = False
+                    elif gate.forced:
+                        self_test_state.submitted_with_failing_checks = True
+
                 messages.append(
                     {
                         "role": "tool",
@@ -313,7 +568,7 @@ class Vanillux2Agent(BaseAgent):
                     }
                 )
 
-                if action["type"] == "done" or SUBMIT_MARKER in tool_content:
+                if action["type"] == "done" or is_implicit_submit:
                     break
         finally:
             self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -337,11 +592,61 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+
+            # Best-effort final read of the criteria file so adoption metrics
+            # are accurate even for bash-mode runs that declared criteria but
+            # never reached a check or the gate (the snapshot only refreshes
+            # at those points); the environment may already be gone here.
+            criteria_view = dict(self_test_state.criteria_snapshot)
+            if self.enable_self_test_gate:
+                try:
+                    final_criteria, _ = await self_test.load_criteria(ops, self._self_test_config)
+                    criteria_view = {cid: c.description for cid, c in final_criteria.items()}
+                except Exception:
+                    pass
+            check_records = [r for records in self_test_state.checks.values() for r in records]
+            coverage_view = self_test.coverage(
+                {cid: self_test.Criterion(cid, desc) for cid, desc in criteria_view.items()},
+                self_test_state,
+            )
+            if self.enable_self_test_gate:
+                (self.logs_dir / "self_test.json").write_text(
+                    json.dumps(
+                        {
+                            "enabled": True,
+                            "criteria": criteria_view,
+                            "coverage": coverage_view,
+                            "gate_rejections": self_test_state.gate_rejections,
+                            "submitted_with_failing_checks": self_test_state.submitted_with_failing_checks,
+                            "checks": {
+                                cid: [asdict(r) for r in records]
+                                for cid, records in self_test_state.checks.items()
+                            },
+                            "audit": self_test_state.audit,
+                        },
+                        indent=2,
+                    )
+                    + "\n"
+                )
             context.metadata = {
                 "compaction": {
                     "stubbed_writes": compaction_stats.stubbed_writes,
                     "truncated_outputs": compaction_stats.truncated_outputs,
-                }
+                },
+                "self_test": {
+                    "enabled": self.enable_self_test_gate,
+                    "criteria_declared": len(criteria_view),
+                    "criteria_covered": sum(coverage_view.values()),
+                    "checks_run": len(check_records),
+                    "checks_by_category": dict(
+                        Counter(r.check_category for r in check_records)
+                    ),
+                    "session_isolation_discrepancies": sum(
+                        1 for r in check_records if r.session_pass and not r.isolated_pass
+                    ),
+                    "gate_rejections": self_test_state.gate_rejections,
+                    "submitted_with_failing_checks": self_test_state.submitted_with_failing_checks,
+                },
             }
 
     async def _query_with_retry(
@@ -416,6 +721,8 @@ class Vanillux2Agent(BaseAgent):
             content = _format_error_message(
                 "Your last response did not include a valid `bash` tool call."
             )
+        if self._self_test_tools_enabled:
+            content = f"{content}{_SELF_TEST_FORMAT_ERROR_ADDENDUM}"
         if tool_call_id:
             messages.append(
                 {

@@ -151,12 +151,16 @@ def _safe_json_loads(raw: Any) -> dict | None:
         return None
 
 
-def extract_action(response_msg: dict) -> dict[str, Any]:
+def extract_action(
+    response_msg: dict, extra_tool_names: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """Parse a tool-calling response message into an action dict.
 
     ``type`` is one of ``"no_tool_call"`` (format error — no tool call, or a
     tool name we don't recognize), ``"done"`` (bash command containing the
-    submit marker), or ``"tool"`` (bash or any Feature-3 tool).
+    submit marker), or ``"tool"`` (bash, any Feature-3 tool, or a name in
+    ``extra_tool_names`` — used by ``Vanillux2Agent/self_test.py``'s
+    ``declare_criteria``/``run_check`` when the self-test gate is enabled).
     """
     tool_calls = response_msg.get("tool_calls")
     if not tool_calls:
@@ -167,7 +171,7 @@ def extract_action(response_msg: dict) -> dict[str, Any]:
     name = func.get("name", "")
     tool_call_id = tc.get("id")
 
-    if name not in ALL_TOOL_NAMES:
+    if name not in ALL_TOOL_NAMES and name not in extra_tool_names:
         return {"type": "no_tool_call", "name": name, "args": None, "tool_call_id": tool_call_id}
 
     args = _safe_json_loads(func.get("arguments", "{}"))
