@@ -4,6 +4,15 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (wallclock_only) adds WALL-CLOCK DISCIPLINE and nothing else, so
+an A/B against the replicate baseline isolates its effect: a bounded
+per-request LLM timeout (one hung request used to be able to eat an entire
+agent budget), command timeouts converted to model-visible results instead
+of run-ending exceptions (harbor's docker exec RAISES on timeout), and
+`timeout N <cmd>` in a command raising its exec deadline (the prompt already
+teaches that idiom; the harness used to kill at a flat 120s regardless —
+27% of baseline runs hit that cap at least once).
 """
 
 from __future__ import annotations
@@ -15,6 +24,7 @@ import os
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import litellm
@@ -48,9 +58,18 @@ ABORT_EXCEPTIONS = (
 
 MAX_RETRIES = 5
 RETRY_BASE_DELAY = 2.0
-LLM_TIMEOUT_SECONDS = 5 * 60 * 60
 LLM_OUTER_TIMEOUT_BUFFER_SECONDS = 30
 _STATE_DIR = "/tmp/.vanillux2"
+# Model-requested command timeouts: the prompt tells the model to wrap long
+# commands with `timeout N <cmd>`; honor that by raising the exec deadline to
+# N plus this margin (bounded by max_command_timeout), so `timeout 300 make`
+# isn't killed at the default 120s while the model believes it has 300.
+_TIMEOUT_REQUEST_RE = re.compile(
+    r"\btimeout\s+(?:(?:-k|--kill-after|-s|--signal)(?:[= ]\S+)\s+|--foreground\s+|--preserve-status\s+)*"
+    r"(?P<n>\d+(?:\.\d+)?)(?P<unit>[smhd]?)\b"
+)
+_TIMEOUT_REQUEST_MARGIN_SECONDS = 30
+_TIMEOUT_UNIT_SECONDS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _COMPOSE_PROVIDER_RE = re.compile(
     r"\x1b\[4m>>>> Executing external compose provider "
     r'"[^"]*docker-compose"\. Please see podman-compose\(1\) for how to disable '
@@ -60,6 +79,29 @@ _DOCKER_EXEC_ERROR_RE = re.compile(
     r"(?ms)^Error: executing [^\n]*(?:docker-compose|docker compose)"
     r".*?: exit status \d+\s*$"
 )
+
+
+def _looks_like_exec_timeout(exc: Exception) -> bool:
+    return isinstance(exc, asyncio.TimeoutError) or "timed out" in str(exc).lower()
+
+
+def _timed_out_result(timeout_sec: int) -> Any:
+    """Duck-types harbor's ExecResult for a command the harness terminated.
+
+    harbor's docker environment RAISES on exec timeout (RuntimeError
+    "Command timed out after Ns") rather than returning a result — unhandled,
+    one slow command would end the whole run as a harness exception.
+    """
+    return SimpleNamespace(
+        stdout="",
+        stderr=(
+            f"(harness) command did not finish within {timeout_sec}s and was terminated; "
+            "its effects may be partially applied. For long-running work, request more time "
+            "with an explicit `timeout N <cmd>` (N in seconds), run it in the background "
+            "with `nohup ... &` and poll, or break it into smaller steps."
+        ),
+        return_code=124,
+    )
 
 
 class Vanillux2Agent(BaseAgent):
@@ -86,8 +128,22 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        llm_timeout: int = 900,
+        max_command_timeout: int = 600,
         **kwargs: Any,
     ) -> None:
+        """
+        Wall-clock flags (see the module docstring):
+
+        llm_timeout: per-request LLM timeout in seconds (retried with
+            backoff). The old effectively-unbounded value (5 h) let one hung
+            request eat an entire agent wall-clock budget.
+        max_command_timeout: upper bound on the exec deadline granted when
+            the model wraps a command with `timeout N ...` (the exec deadline
+            is raised to N + a margin, capped here). A command that still
+            overruns is terminated and reported to the model as a timeout
+            instead of crashing the run.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +155,8 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.llm_timeout = llm_timeout
+        self.max_command_timeout = max_command_timeout
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -243,7 +301,7 @@ class Vanillux2Agent(BaseAgent):
         )
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                llm_timeout = LLM_TIMEOUT_SECONDS
+                llm_timeout = self.llm_timeout
                 completion_kwargs: dict[str, Any] = {
                     "model": model,
                     "messages": messages,
@@ -325,13 +383,39 @@ class Vanillux2Agent(BaseAgent):
             "exit $_vanillux2_ec"
         )
 
+    def _requested_timeout_sec(self, command: str) -> int | None:
+        """Largest `timeout N` the model asked for anywhere in *command*."""
+        best: int | None = None
+        for m in _TIMEOUT_REQUEST_RE.finditer(command or ""):
+            seconds = int(float(m.group("n")) * _TIMEOUT_UNIT_SECONDS[m.group("unit")])
+            if best is None or seconds > best:
+                best = seconds
+        return best
+
+    def _command_deadline_sec(self, command: str) -> int:
+        requested = self._requested_timeout_sec(command)
+        if requested is None:
+            return self.command_timeout
+        granted = requested + _TIMEOUT_REQUEST_MARGIN_SECONDS
+        cap = max(self.max_command_timeout, self.command_timeout)
+        return min(max(self.command_timeout, granted), cap)
+
     async def _execute_bash(
         self, command: str, environment: BaseEnvironment
     ) -> Any:
-        return await environment.exec(
-            command=self._wrap_command(command),
-            timeout_sec=self.command_timeout,
-        )
+        timeout_sec = self._command_deadline_sec(command)
+        try:
+            return await environment.exec(
+                command=self._wrap_command(command),
+                timeout_sec=timeout_sec,
+            )
+        except (asyncio.TimeoutError, RuntimeError) as exc:
+            # See _timed_out_result: harbor raises on exec timeout; anything
+            # else is a real environment failure and still propagates.
+            if not _looks_like_exec_timeout(exc):
+                raise
+            logger.warning("Command timed out after %ss: %s", timeout_sec, command[:120])
+            return _timed_out_result(timeout_sec)
 
     @staticmethod
     def _format_tool_result(result: Any) -> str:
