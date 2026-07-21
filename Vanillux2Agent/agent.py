@@ -4,6 +4,16 @@ This is the Harbor-agent version of ``rl_data.generator.vanillux_solver``:
 it uses the same mini-SWE-agent-derived prompts, bash tool schema, submit
 marker, format-error recovery, and output truncation, but executes commands
 through Harbor's active environment and calls the model directly with LiteLLM.
+
+This branch (error_hints) appends TARGETED RECOVERY HINTS to tool results
+whose output matches a known error signature, and nothing else, so an A/B
+against the replicate baseline isolates the effect. The signatures come
+from a 444-run failure analysis, counting runs (not occurrences) that
+contain each error, fail vs pass: `command not found` 57% vs 39%,
+`No such file or directory` 31% vs 20%, `ModuleNotFoundError/ImportError`
+25% vs 22%, plus pip/network install failures 4% vs 1%. Each distinct hint
+fires at most once per run (a model shouldn't drown in repeated advice),
+appended to the observation the model already sees.
 """
 
 from __future__ import annotations
@@ -61,6 +71,48 @@ _DOCKER_EXEC_ERROR_RE = re.compile(
     r".*?: exit status \d+\s*$"
 )
 
+# Error-signature -> recovery hint. Ordered: the first match on an
+# observation wins (so a compound failure gets its most specific hint), and
+# each key fires at most once per run. Signatures + rates from the 444-run
+# baseline analysis (share of runs containing the error, fail vs pass).
+_ERROR_HINTS: list[tuple[str, re.Pattern[str], str]] = [
+    (
+        "cmd_not_found",
+        re.compile(r"command not found|: not found"),
+        "A command was not found. Before assuming a tool is missing: check the exact "
+        "name/spelling, whether it needs an absolute path or a venv/conda activation, "
+        "and whether the project ships it under a different name (`ls`, `which -a`, "
+        "`compgen -c | grep`, or read the project's README/Makefile). Install only as a "
+        "last resort, and check what package actually provides it first.",
+    ),
+    (
+        "module_not_found",
+        re.compile(r"ModuleNotFoundError|No module named|ImportError"),
+        "A Python import failed. The module may already be present under a different "
+        "interpreter or env (`python3` vs `python`, a venv, `pip list`), importable from "
+        "a different working directory, or vendored in the repo. Confirm which "
+        "interpreter and cwd you need before installing anything.",
+    ),
+    (
+        "install_fail",
+        re.compile(
+            r"Could not find a version|No matching distribution|Temporary failure in name resolution"
+            r"|Could not resolve host|Network is unreachable|Connection refused",
+            re.I,
+        ),
+        "A download/install failed, likely because this environment has no or limited "
+        "network access. Prefer what is already installed or vendored in the repo; do "
+        "not build the solution around a package you cannot install.",
+    ),
+    (
+        "no_such_file",
+        re.compile(r"No such file or directory"),
+        "A path did not exist. Check your current directory (`pwd`) and list the parent "
+        "(`ls -la`) — the file may be under a different directory than you assumed, or "
+        "you may need to create the parent first. Prefer absolute paths for deliverables.",
+    ),
+]
+
 
 class Vanillux2Agent(BaseAgent):
     """Bash-tool Harbor agent with vanillux prompts and direct API calls."""
@@ -86,8 +138,15 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        enable_error_hints: bool = True,
         **kwargs: Any,
     ) -> None:
+        """
+        enable_error_hints: append a one-shot recovery hint to a tool result
+            whose output matches a known error signature (command-not-found,
+            missing module, failed install, missing path). Each signature
+            fires at most once per run.
+        """
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.max_steps = max_steps
         self.temperature = temperature
@@ -99,6 +158,7 @@ class Vanillux2Agent(BaseAgent):
         self.command_timeout = command_timeout
         self.persistent_bash = persistent_bash
         self.max_format_errors = max_format_errors
+        self.enable_error_hints = enable_error_hints
         self.cost: float = 0.0
 
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -133,6 +193,7 @@ class Vanillux2Agent(BaseAgent):
             "reasoning_tokens": 0,
         }
         format_errors = 0
+        error_hints_fired: set[str] = set()
 
         try:
             for step in range(self.max_steps):
@@ -190,6 +251,23 @@ class Vanillux2Agent(BaseAgent):
                 exec_time = time.monotonic() - t1
 
                 tool_content = self._format_tool_result(result)
+
+                # Targeted recovery hint: only on a nonzero exit, only the
+                # first matching signature, and only once per signature per
+                # run. Appended to the observation the model already sees.
+                hint_key = None
+                if (
+                    self.enable_error_hints
+                    and result.return_code != 0
+                    and SUBMIT_MARKER not in tool_content
+                ):
+                    for key, rx, hint in _ERROR_HINTS:
+                        if key not in error_hints_fired and rx.search(tool_content):
+                            error_hints_fired.add(key)
+                            hint_key = key
+                            tool_content += f"\n\n(harness hint) {hint}"
+                            break
+
                 messages.append(
                     {
                         "role": "tool",
@@ -205,6 +283,7 @@ class Vanillux2Agent(BaseAgent):
                         "bash_s": round(exec_time, 1),
                         "return_code": result.return_code,
                         "cmd": command[:200],
+                        **({"error_hint": hint_key} if hint_key else {}),
                     }
                 )
 
@@ -232,6 +311,7 @@ class Vanillux2Agent(BaseAgent):
             context.cost_usd = self.cost
             context.n_input_tokens = usage_totals["prompt_tokens"]
             context.n_output_tokens = usage_totals["completion_tokens"]
+            context.metadata = {"error_hints": {"fired": sorted(error_hints_fired)}}
 
     async def _query_with_retry(
         self, model: str, messages: list[dict[str, Any]]
