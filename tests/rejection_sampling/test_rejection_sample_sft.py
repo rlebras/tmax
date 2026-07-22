@@ -160,6 +160,27 @@ def test_eval_source_refused(tmp_path):
         list(rs.load_records([p]))
 
 
+def test_terminal_bench_slug_still_refused(tmp_path):
+    # terminal-bench eval experiments are named eval-tmax-9b-tb21-*; the tb-slug
+    # must still trip the guard.
+    p = tmp_path / "eval-tmax-9b-tb21-64k" / "run_summary.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"results": [{"reward": 1, "messages": _traj("ls")}]}))
+    with pytest.raises(ValueError, match="eval-sourced"):
+        list(rs.load_records([p]))
+
+
+def test_rejsample_rollout_path_allowed(tmp_path):
+    # legit training rollouts also run through launch_eval.sh and land in
+    # eval-tmax-9b-rejsample-* dirs — the "eval-" prefix must NOT refuse them.
+    assert rs._looks_like_eval_source("/x/eval-tmax-9b-rejsample-smoke/task_000355__abc") is False
+    p = tmp_path / "eval-tmax-9b-rejsample-smoke" / "run_summary.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"results": [{"reward": 1, "messages": _traj("ls")}]}))
+    recs = list(rs.load_records([p]))  # must NOT raise
+    assert len(recs) == 1
+
+
 def test_eval_source_allowed_with_override(tmp_path):
     p = tmp_path / "evaluation_assets" / "run_summary.json"
     p.parent.mkdir(parents=True)

@@ -89,6 +89,11 @@ BASH_TOOL = {
 
 # Path fragments that mark an input as a terminal-bench EVAL artifact rather
 # than a training rollout. Harvesting these as SFT data is test-set leakage.
+# NB: match the terminal-bench dataset/slug specifically, NOT the generic
+# "eval-" launch prefix — legitimate training rollouts also run through
+# launch_eval.sh and land in "eval-tmax-9b-rejsample-*" dirs, which must be
+# allowed. terminal-bench eval experiments are "eval-tmax-9b-tb2{0,1}-*", so
+# the tb-slug markers below catch them without over-matching.
 _EVAL_SOURCE_MARKERS = (
     "terminal-bench",
     "terminal_bench",
@@ -96,7 +101,6 @@ _EVAL_SOURCE_MARKERS = (
     "tb-21",
     "tb20",
     "tb-20",
-    "eval-tmax",
     "evaluation_assets",
 )
 
