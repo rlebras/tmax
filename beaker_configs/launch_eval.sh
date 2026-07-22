@@ -76,6 +76,10 @@ HARBOR_VERIFIER_TIMEOUT_MULTIPLIER=""
 HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER=""
 HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER=""
 HARBOR_AGENT_TIMEOUT_SEC=""
+# Gantry --min-runtime: minimum guaranteed wall-clock before Beaker may
+# preempt the job. These evals sweep many tasks x N attempts and are costly
+# to restart from scratch, so guarantee a solid block by default.
+MIN_RUNTIME="8h"
 
 usage() {
     cat <<EOF
@@ -150,6 +154,9 @@ Options:
                         harbor environment build timeout multiplier
   --agent-timeout-sec SEC
                         exact harbor agent timeout override in seconds
+  --min-runtime DUR     gantry minimum guaranteed runtime before the job can
+                        be preempted, e.g. "8h", "30m" (default: 8h; "0"
+                        lets the job be preempted at any time)
 EOF
     exit 1
 }
@@ -205,6 +212,7 @@ while [ $# -gt 0 ]; do
         --agent-setup-timeout-multiplier) HARBOR_AGENT_SETUP_TIMEOUT_MULTIPLIER="$2"; shift 2 ;;
         --environment-build-timeout-multiplier) HARBOR_ENVIRONMENT_BUILD_TIMEOUT_MULTIPLIER="$2"; shift 2 ;;
         --agent-timeout-sec) HARBOR_AGENT_TIMEOUT_SEC="$2"; shift 2 ;;
+        --min-runtime)     MIN_RUNTIME="$2"; shift 2 ;;
         -h|--help)         usage ;;
         *) echo "unknown option: $1"; usage ;;
     esac
@@ -245,6 +253,7 @@ cat <<EOF
   Task resources: cpus=${HARBOR_OVERRIDE_CPUS:-<task default>} memory_mb=${HARBOR_OVERRIDE_MEMORY_MB:-<task default>} storage_mb=${HARBOR_OVERRIDE_STORAGE_MB:-<task default>} gpus=${HARBOR_OVERRIDE_GPUS:-<task default>}
   Timeouts:     agent_sec=${HARBOR_AGENT_TIMEOUT_SEC:-<task default>} timeout_mult=${HARBOR_TIMEOUT_MULTIPLIER:-<default>} agent_mult=${HARBOR_AGENT_TIMEOUT_MULTIPLIER:-<default>} verifier_mult=${HARBOR_VERIFIER_TIMEOUT_MULTIPLIER:-<default>}
   Model info:   ${HOSTED_VLLM_MODEL_INFO:-<auto>}
+  Min runtime:  ${MIN_RUNTIME:-<server default>}
   Job name:     ${JOB_NAME}
   Results dir:  ${RESULTS_DIR}
   Image:        ${BEAKER_IMAGE:+beaker:${BEAKER_IMAGE}}${BEAKER_DOCKER_IMAGE:+docker:${BEAKER_DOCKER_IMAGE}}
@@ -340,6 +349,10 @@ fi
 
 if [ -n "$BUDGET" ]; then
     GANTRY_CMD+=(--budget "$BUDGET")
+fi
+
+if [ -n "$MIN_RUNTIME" ]; then
+    GANTRY_CMD+=(--min-runtime "$MIN_RUNTIME")
 fi
 
 if [ "$RESULTS_DIR" = "/results" ]; then
