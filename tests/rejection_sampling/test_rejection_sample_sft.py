@@ -197,6 +197,92 @@ def test_load_jsonl(tmp_path):
     assert {r.task_id for r in recs} == {"t1", "t2"}
 
 
+def _write_harbor_trial(root: Path, task: str, trial: str, reward: float, msgs: list[dict]):
+    d = root / f"{task}__{trial}"
+    (d / "agent").mkdir(parents=True)
+    (d / "result.json").write_text(json.dumps({"verifier_result": {"rewards": {"reward": reward}}}))
+    (d / "agent" / "trajectory.json").write_text(json.dumps(msgs))
+    return d
+
+
+# --- harbor rollout ingestion ------------------------------------------------
+
+
+def test_load_harbor_trials_and_task_grouping(tmp_path):
+    root = tmp_path / "jobs" / "tmax15k-rollouts"
+    _write_harbor_trial(root, "gen-widget", "aaa", 1.0, _traj("ls"))
+    _write_harbor_trial(root, "gen-widget", "bbb", 0.0, _traj("no", submit=False))
+    _write_harbor_trial(root, "gen-parser", "ccc", 1.0, _traj("cat f"))
+    recs = list(rs.load_records(rs._expand_inputs([str(root)])))
+    assert len(recs) == 3
+    # trailing __hash stripped so the two gen-widget attempts share a task id
+    assert {r.task_id for r in recs} == {"gen-widget", "gen-parser"}
+    assert sorted(r.reward for r in recs if r.task_id == "gen-widget") == [0.0, 1.0]
+
+
+def test_harvest_from_harbor_rollouts(tmp_path):
+    root = tmp_path / "jobs" / "rollouts"
+    _write_harbor_trial(root, "t1", "a", 1.0, _traj("ls", "cat"))
+    _write_harbor_trial(root, "t1", "b", 0.0, _traj("x", submit=False))
+    ex = rs.harvest(rs.load_records(rs._expand_inputs([str(root)])), rs.HarvestConfig())
+    assert len(ex) == 1 and ex[0]["id"] == "t1"
+
+
+def test_single_harbor_trial_dir_input(tmp_path):
+    root = tmp_path / "run"
+    d = _write_harbor_trial(root, "t1", "a", 1.0, _traj("ls"))
+    recs = list(rs.load_records(rs._expand_inputs([str(d)])))
+    assert len(recs) == 1 and recs[0].task_id == "t1"
+
+
+# --- relevance band (solve-rate focus) --------------------------------------
+
+
+def test_always_solved_task_skipped_when_max_solve_rate_below_1():
+    # t_easy solved 3/3 (rate 1.0); t_flaky solved 1/3 (rate 0.33)
+    recs = [
+        _rec("t_easy", 1.0, _traj("a")), _rec("t_easy", 1.0, _traj("a", "b")), _rec("t_easy", 1.0, _traj("a", "b", "c")),
+        _rec("t_flaky", 1.0, _traj("z")), _rec("t_flaky", 0.0, _traj("q", submit=False)), _rec("t_flaky", 0.0, _traj("w", submit=False)),
+    ]
+    st = rs.HarvestStats()
+    ex = rs.harvest(recs, rs.HarvestConfig(max_solve_rate=0.8), st)
+    ids = {e["id"] for e in ex}
+    assert ids == {"t_flaky"}                 # easy (always-solved) dropped
+    assert st.tasks_over_solve_rate == 1
+    assert st.dropped_over_solve_rate == 3    # its 3 passing trajectories skipped
+
+
+def test_always_solved_kept_by_default():
+    recs = [_rec("t_easy", 1.0, _traj("a")), _rec("t_easy", 1.0, _traj("a", "b"))]
+    st = rs.HarvestStats()
+    ex = rs.harvest(recs, rs.HarvestConfig(max_solve_rate=1.0), st)
+    assert {e["id"] for e in ex} == {"t_easy"}
+    assert st.tasks_over_solve_rate == 0
+
+
+def test_never_solved_task_yields_nothing():
+    recs = [_rec("t0", 0.0, _traj("a", submit=False)), _rec("t0", 0.0, _traj("b", submit=False))]
+    st = rs.HarvestStats()
+    ex = rs.harvest(recs, rs.HarvestConfig(), st)
+    assert ex == []
+    assert st.tasks_solvable == 0
+    assert st.tasks_seen == 1
+
+
+def test_solve_rate_histogram_counts_solvable_tasks():
+    recs = [
+        _rec("a", 1.0, _traj("x")), _rec("a", 1.0, _traj("y")),          # 2/2 = 1.0
+        _rec("b", 1.0, _traj("x")), _rec("b", 0.0, _traj("y", submit=False)),  # 1/2 = 0.5
+        _rec("c", 0.0, _traj("x", submit=False)),                        # 0/1 never solved
+    ]
+    st = rs.HarvestStats()
+    rs.harvest(recs, rs.HarvestConfig(), st)
+    assert st.tasks_seen == 3
+    assert st.tasks_solvable == 2  # a and b; c excluded
+    assert st.solve_rate_hist.get("1.0 (always)") == 1
+    assert st.solve_rate_hist.get("[0.5,0.75)") == 1
+
+
 def test_end_to_end_cli(tmp_path):
     summ = {"results": [{"reward": 1, "messages": _traj("ls", "cat f")}]}
     src = tmp_path / "gen-task__x_summary.json"

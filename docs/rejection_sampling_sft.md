@@ -21,17 +21,35 @@ on its own successes — turning occasionally-reachable behavior into the
 default, converting pass@k capability into pass@1 reliability, with no human
 labels.
 
+## Which data (canonical corpus)
+
+Roll out on the tmax **training** corpus, which the pipeline decontaminates
+against terminal-bench — never on terminal-bench itself. The published corpus:
+
+- **`tmax/TMax-15K-Harbor`** — 15k self-contained tasks (10k legacy + 5k
+  intricate multimodal), each a Harbor environment with a programmatic
+  verifier. Roll out with `harbor run -d`, the **same harness path as the
+  eval**, so harvested trajectories match the deployment distribution. This is
+  the recommended source.
+- **`allenai/tmax-15k-open-instruct`** — the same corpus in open-instruct
+  format (what the RL scripts consume). Useful if you prefer the RL data path.
+
+The repo already warm-starts SFT this exact way (rl_data README: "roll out 8
+trajectories per environment … the successful (pass) trajectories form the SFT
+corpus"); this is that loop, made re-runnable and focused on the payoff band.
+
 ## The loop
 
 ```
-[1] generate   run_rejection_sampling_rollouts.sh
-    tmax-9b (vLLM) × the rl_data TRAINING corpus, k=16 rollouts/task, temp 1.0
-        │  writes  <task>/solutions/<model>_vanillux_summary.json
-        ▼          (each = {results: [{reward, messages, ...}]})
-[2] harvest    rl_data/rejection_sample_sft.py
-    keep reward==1 · drop format-errors · require a clean submit · dedup ·
-    cap per task · length-cap  →  SFT jsonl ({messages, tools, dataset, id})
-        │  (optionally --push-to-hub <you>/tmax-rejsample-sft)
+[1] generate   run_rejection_sampling_rollouts.sh  (or `harbor run -d tmax/TMax-15K-Harbor`)
+    tmax-9b (vLLM) × the training corpus, k=16 rollouts/task, temp 1.0
+        │  harbor path:  jobs/<job>/<task>/{result.json, agent/trajectory.json}
+        │  rl_data path: <task>/solutions/<model>_vanillux_summary.json
+        ▼
+[2] harvest    rl_data/rejection_sample_sft.py   (reads BOTH layouts)
+    per-task solve-rate focus (--max-solve-rate) · keep reward==1 · drop
+    format-errors · require a clean submit · dedup · cap per task · length-cap
+        │  →  SFT jsonl ({messages, tools, dataset, id})  (optionally --push-to-hub)
         ▼
 [3] train      sft_qwen35_9b_rejsample.sh
     open_instruct/finetune.py on the harvested data (base hamishivi/Qwen3.5-9B)
@@ -40,6 +58,24 @@ labels.
 ```
 
 Iterate: the SFTed checkpoint becomes the model in step 1 of the next round.
+
+## Focus on the instances where rejection sampling is relevant
+
+Rejection-sampling SFT only helps on tasks the model solves **sometimes but
+not reliably** (`0 < solve_rate < 1`). Always-solved tasks teach nothing (and,
+being easy, flood the mixture with short redundant trajectories); never-solved
+tasks have nothing to harvest. The harvester computes each task's solve-rate
+across its attempts, prints the distribution, and `--max-solve-rate` drops
+already-reliable tasks.
+
+To make this concrete, harvesting the tmax-9b terminal-bench baseline as a
+*format* example (89 tasks) showed the payoff band clearly: 44 tasks solvable,
+but 12 already solved on every attempt (redundant) and 16 barely solved
+(`<0.25` — the highest-value targets). Only ~32 tasks are in the band where
+rejection sampling actually moves pass@1. `--max-solve-rate 0.8` keeps exactly
+those. At rollout time, the complement is to spend MORE samples on the flaky
+tasks (they are where each extra rollout has the best chance of yielding a new
+harvestable success), rather than uniformly across the corpus.
 
 ## Contamination guard (the one thing you must not get wrong)
 
@@ -60,13 +96,14 @@ sbatch rl_data/scripts/generate_solutions/run_rejection_sampling_rollouts.sh
 #   knobs (env): VLLM_MODEL, NUM_SOLUTIONS (default 16), SOLUTION_TEMPERATURE
 #   (1.0), TASKS_DIR (the rl_data corpus), SAMPLE_SIZE (0 = full).
 
-# [2] harvest + convert  (local, no GPU)
+# [2] harvest + convert  (local, no GPU) — reads harbor jobs/ dirs OR rl_data summaries
 uv run python -m rl_data.rejection_sample_sft \
-    rl_data/output/tasks_skill_tax_20260401_10k \
+    jobs/<rollout-job>              # or rl_data/output/<corpus> \
     --out rl_data/output/rejsample_sft.jsonl \
-    --max-per-task 4 --max-tokens 32000 \
+    --max-per-task 4 --max-tokens 32000 --max-solve-rate 0.8 \
     --push-to-hub <you>/tmax-rejsample-sft
-#   prints a harvest report: passing / kept / dropped-{format,submit,dup,cap,len}.
+#   prints a harvest report + the per-task solve-rate distribution
+#   (passing / kept / dropped-{format,submit,dup,cap,len,solve_rate}).
 
 # [3] SFT  (cluster)
 DATASET=<you>/tmax-rejsample-sft \

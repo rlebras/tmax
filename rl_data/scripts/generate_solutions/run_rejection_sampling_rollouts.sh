@@ -22,14 +22,34 @@
 #     trajectory to harvest. Coverage of the reachable-solution set is what
 #     matters here, not a calibrated pass@k estimate.
 #
-# CONTAMINATION GUARD: TASKS_DIR MUST be the rl_data generated corpus (already
-# decontaminated vs terminal-bench). Never point this at terminal-bench tasks
-# — training on the eval set is leakage (rejection_sample_sft.py also refuses
+# CONTAMINATION GUARD: the corpus MUST be the tmax training corpus (already
+# decontaminated vs terminal-bench). Never roll out on terminal-bench tasks —
+# training on the eval set is leakage (rejection_sample_sft.py also refuses
 # eval-sourced inputs downstream).
+#
+# CANONICAL CORPUS. The published training corpus is `tmax/TMax-15K-Harbor`
+# (15k tasks = 10k legacy + 5k intricate, decontaminated), mirrored in
+# open-instruct format as `allenai/tmax-15k-open-instruct`. Two rollout paths:
+#
+#   (A) Harbor path — RECOMMENDED, matches the eval harness exactly and reads
+#       straight into rejection_sample_sft.py's harbor-layout ingestion:
+#         uv run harbor run -d "tmax/TMax-15K-Harbor@latest" \
+#             --agent Vanillux2Agent:Vanillux2Agent --model "<served tmax-9b>" \
+#             --n-attempts 16 --env docker
+#       -> jobs/<job>/<task>/{result.json, agent/trajectory.json}
+#       (serve tmax-9b via vLLM the same way beaker_configs/launch_eval.sh does).
+#
+#   (B) rl_data-native path — the local generated corpus + apptainer, below.
+#       Produces <task>/solutions/<model>_vanillux_summary.json.
+#
+# Both feed the same harvester. This script runs path (B); use (A) directly
+# for the published corpus.
 
 set -euo pipefail
 
 # ---- rejection-sampling parameters ----
+# Point at a local rl_data generated corpus (path B). For the canonical 15k
+# corpus prefer the Harbor path (A) above.
 TASKS_DIR="${TASKS_DIR:-rl_data/output/tasks_skill_tax_20260401_10k}"
 
 export LAUNCH_VLLM="${LAUNCH_VLLM:-1}"
@@ -96,6 +116,7 @@ uv run python -m rl_data.generate_solutions \
     "${EXTRA_ARGS[@]}"
 
 echo
-echo "Rollouts written under $TASKS_DIR/*/solutions/. Next:"
+echo "Rollouts written under $TASKS_DIR/*/solutions/. Next (harvest, focusing the flaky band):"
 echo "  uv run python -m rl_data.rejection_sample_sft $TASKS_DIR \\"
-echo "      --out rl_data/output/rejsample_sft.jsonl --push-to-hub <you>/tmax-rejsample-sft"
+echo "      --out rl_data/output/rejsample_sft.jsonl --max-solve-rate 0.8 \\"
+echo "      --push-to-hub <you>/tmax-rejsample-sft"

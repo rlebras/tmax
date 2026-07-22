@@ -26,9 +26,27 @@ refuses inputs whose path looks like a terminal-bench eval unless the caller
 passes ``allow_eval_source=True`` (only ever legitimate for building test
 fixtures, never for real training data).
 
+Which tasks are worth harvesting (``--max-solve-rate``)
+-------------------------------------------------------
+Rejection-sampling SFT only helps on tasks the model solves *sometimes but
+not reliably*. A task it already passes on every attempt (solve-rate 1.0) has
+nothing to teach — its trajectories are redundant and, being easy, tend to be
+short and plentiful, so they crowd the mixture. A task it never solves
+(solve-rate 0.0) has nothing to harvest. The payoff band is ``0 < solve_rate
+< 1``. The harvester computes each task's solve-rate across all its attempts,
+prints the distribution, and ``--max-solve-rate`` drops already-reliable tasks
+so training concentrates on the flaky band. (Complement at rollout time: spend
+more samples on the flaky tasks — see the rollout launcher.)
+
 Input formats accepted (see ``load_records``):
   * rl_data ``*_summary.json`` from ``run_n_solutions`` — a dict with
     ``results: [{success/reward, messages, ...}]``.
+  * a **harbor rollout dir** — ``<root>/<task>/{result.json, agent/trajectory.json}``
+    (what ``harbor run -d tmax/TMax-15K-Harbor --agent Vanillux2Agent``
+    produces, i.e. the same harness path as the eval, on the canonical
+    decontaminated training corpus). One trial dir = one attempt; the task id
+    is the dir name with its trailing ``__<hash>`` stripped so the k attempts
+    of a task group together for the solve-rate.
   * a JSONL where each line is ``{task_id, reward, messages}``.
 
 Output: a JSONL of ``{messages, tools, dataset, id}`` rows ready for
@@ -90,6 +108,10 @@ class HarvestConfig:
     drop_format_errors: bool = True  # drop trajectories containing a malformed/no-tool-call turn
     require_submit: bool = True      # keep only trajectories that end on the submit sentinel
     min_assistant_turns: int = 1     # drop trivial trajectories with fewer than this many actions
+    # Relevance band: keep a task only if 0 < its solve-rate <= max_solve_rate.
+    # max_solve_rate=1.0 keeps everything solvable; lower it (e.g. 0.8) to drop
+    # already-reliable tasks and concentrate on the flaky payoff band.
+    max_solve_rate: float = 1.0
     tools: list = field(default_factory=lambda: [BASH_TOOL])
 
 
@@ -105,6 +127,11 @@ class HarvestStats:
     dropped_too_short: int = 0
     dropped_dup: int = 0
     dropped_over_cap: int = 0
+    dropped_over_solve_rate: int = 0   # passing trajectories skipped because their task is already reliable
+    tasks_seen: int = 0
+    tasks_solvable: int = 0            # tasks with >=1 success (harvestable at all)
+    tasks_over_solve_rate: int = 0     # solvable tasks skipped by max_solve_rate
+    solve_rate_hist: dict = field(default_factory=dict)  # coarse solve-rate buckets over solvable tasks
     per_task_kept: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
@@ -143,6 +170,38 @@ def _reward_of(obj: dict) -> float:
     return 0.0
 
 
+def _task_base(name: str) -> str:
+    """Strip a harbor trial dir's trailing ``__<hash>`` so the k attempts of a
+    task share one task id for the solve-rate."""
+    return name.rsplit("__", 1)[0] if "__" in name else name
+
+
+def _harbor_reward(result: dict) -> float:
+    rewards = (result.get("verifier_result") or {}).get("rewards") or {}
+    r = rewards.get("reward")
+    try:
+        return float(r) if r is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_from_harbor_trial(trial_dir: Path) -> Record | None:
+    """One harbor trial dir (``result.json`` + ``agent/trajectory.json``) ->
+    one attempt Record. Returns None if either file is missing/malformed."""
+    rj = trial_dir / "result.json"
+    tj = trial_dir / "agent" / "trajectory.json"
+    if not (rj.is_file() and tj.is_file()):
+        return None
+    try:
+        result = json.loads(rj.read_text())
+        messages = json.loads(tj.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(messages, list):
+        return None
+    return Record(_task_base(trial_dir.name), _harbor_reward(result), messages, str(trial_dir))
+
+
 def _records_from_summary(doc: dict, source: str, task_id: str | None) -> Iterator[Record]:
     results = doc.get("results")
     if not isinstance(results, list):
@@ -176,6 +235,14 @@ def load_records(
             )
         if stats is not None:
             stats.files_read += 1
+        # A harbor trial dir (result.json + agent/trajectory.json).
+        if p.is_dir():
+            rec = _record_from_harbor_trial(p)
+            if rec is not None:
+                yield rec
+            else:
+                print(f"warning: {p} is not a harbor trial dir; skipped", file=sys.stderr)
+            continue
         try:
             text = p.read_text()
         except OSError as exc:
@@ -319,15 +386,55 @@ def to_sft_example(task_id: str, messages: list[dict], tools: list) -> dict:
     }
 
 
+def _solve_rate_bucket(rate: float) -> str:
+    if rate >= 1.0:
+        return "1.0 (always)"
+    if rate >= 0.75:
+        return "[0.75,1.0)"
+    if rate >= 0.5:
+        return "[0.5,0.75)"
+    if rate >= 0.25:
+        return "[0.25,0.5)"
+    return "(0,0.25)"
+
+
 def harvest(records: Iterable[Record], config: HarvestConfig, stats: HarvestStats | None = None) -> list[dict]:
     """Filter passing records into cleaned, deduped SFT examples.
 
-    Deterministic: for a per-task cap it keeps the SHORTEST passing
-    trajectories (cheapest correct demonstrations, and least likely to include
-    flailing), breaking ties by dedup key for stability.
+    Two passes. First, compute each task's solve-rate across ALL its attempts
+    and keep only tasks in the relevant band (``0 < rate <= max_solve_rate``) —
+    rejection sampling has nothing to teach on always-solved tasks and nothing
+    to harvest on never-solved ones. Second, from the in-band tasks, filter the
+    passing trajectories (clean, submit, length), dedup, and cap per task
+    (SHORTEST first — cheapest correct demonstrations, least flailing).
+    Deterministic given the same records.
     """
     stats = stats or HarvestStats()
-    # bucket candidate (clean, passing) trajectories per task
+    records = list(records)
+
+    # Pass 1 — per-task solve-rate over all attempts.
+    totals: dict[str, int] = defaultdict(int)
+    successes: dict[str, int] = defaultdict(int)
+    for rec in records:
+        totals[rec.task_id] += 1
+        if rec.reward >= 1.0:
+            successes[rec.task_id] += 1
+    stats.tasks_seen = len(totals)
+    focus: set[str] = set()
+    for tid, n in totals.items():
+        rate = successes[tid] / n if n else 0.0
+        if successes[tid] == 0:
+            continue  # never solved: nothing to harvest
+        stats.tasks_solvable += 1
+        stats.solve_rate_hist[_solve_rate_bucket(rate)] = (
+            stats.solve_rate_hist.get(_solve_rate_bucket(rate), 0) + 1
+        )
+        if rate > config.max_solve_rate:
+            stats.tasks_over_solve_rate += 1
+            continue  # already reliable: skip the redundant demonstrations
+        focus.add(tid)
+
+    # Pass 2 — harvest passing trajectories from in-band tasks only.
     candidates: dict[str, list[tuple[int, str, list[dict]]]] = defaultdict(list)
     seen_keys: set[str] = set()
 
@@ -336,6 +443,9 @@ def harvest(records: Iterable[Record], config: HarvestConfig, stats: HarvestStat
         if rec.reward < 1.0:
             continue
         stats.passing += 1
+        if rec.task_id not in focus:
+            stats.dropped_over_solve_rate += 1
+            continue
         msgs = rec.messages
         if config.drop_format_errors and has_format_error(msgs):
             stats.dropped_format_error += 1
@@ -374,14 +484,28 @@ def harvest(records: Iterable[Record], config: HarvestConfig, stats: HarvestStat
 
 
 def _expand_inputs(inputs: list[str]) -> list[str]:
+    """Expand dirs into concrete inputs: rl_data ``*_summary.json`` / ``*.jsonl``
+    files, and harbor trial dirs (each dir holding ``result.json`` +
+    ``agent/trajectory.json``). A path that is itself a harbor trial dir is
+    kept as-is."""
     out: list[str] = []
     for i in inputs:
         p = Path(i)
-        if p.is_dir():
-            out += [str(q) for q in sorted(p.rglob("*_summary.json"))]
-            out += [str(q) for q in sorted(p.rglob("*.jsonl"))]
-        else:
+        if not p.is_dir():
             out.append(i)
+            continue
+        if (p / "result.json").is_file() and (p / "agent" / "trajectory.json").is_file():
+            out.append(str(p))  # a single trial dir
+            continue
+        out += [str(q) for q in sorted(p.rglob("*_summary.json"))]
+        out += [str(q) for q in sorted(p.rglob("*.jsonl"))]
+        # harbor trial dirs nested anywhere under p
+        seen = set(out)
+        for rj in sorted(p.rglob("result.json")):
+            trial = rj.parent
+            if (trial / "agent" / "trajectory.json").is_file() and str(trial) not in seen:
+                out.append(str(trial))
+                seen.add(str(trial))
     return out
 
 
@@ -392,6 +516,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-per-task", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=32000)
     ap.add_argument("--min-assistant-turns", type=int, default=1)
+    ap.add_argument(
+        "--max-solve-rate",
+        type=float,
+        default=1.0,
+        help="keep only tasks with solve-rate <= this (0<rate). 1.0 keeps all "
+        "solvable tasks; lower (e.g. 0.8) to focus on the flaky payoff band and "
+        "drop already-reliable tasks.",
+    )
     ap.add_argument("--keep-format-errors", action="store_true", help="do NOT drop malformed-action trajectories")
     ap.add_argument("--no-require-submit", action="store_true", help="keep trajectories not ending on the submit marker")
     ap.add_argument(
@@ -413,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         max_per_task=args.max_per_task,
         max_tokens=args.max_tokens,
         min_assistant_turns=args.min_assistant_turns,
+        max_solve_rate=args.max_solve_rate,
         drop_format_errors=not args.keep_format_errors,
         require_submit=not args.no_require_submit,
     )
@@ -428,7 +561,13 @@ def main(argv: list[str] | None = None) -> int:
 
     report = stats.as_dict()
     report.pop("per_task_kept", None)
+    hist = report.pop("solve_rate_hist", {})
     print(json.dumps(report, indent=2))
+    print("\nsolve-rate distribution over solvable tasks (where the harvestable signal is):")
+    for bucket in ["(0,0.25)", "[0.25,0.5)", "[0.5,0.75)", "[0.75,1.0)", "1.0 (always)"]:
+        if bucket in hist:
+            note = "  <- redundant (already reliable)" if bucket == "1.0 (always)" else ""
+            print(f"  {bucket:14s} {hist[bucket]}{note}")
     print(f"\nwrote {len(examples)} SFT examples across {report['n_tasks_kept']} tasks to {out}")
     if args.stats_out:
         Path(args.stats_out).write_text(json.dumps(stats.as_dict(), indent=2) + "\n")
