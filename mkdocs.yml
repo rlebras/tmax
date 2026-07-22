@@ -31,5 +31,6 @@ nav:
   - Home: index.md
   - RL data generation: rl_data.md
   - SFT: sft.md
+  - Rejection-sampling SFT: rejection_sampling_sft.md
   - Running evals: running_evals.md
   - Agent harnesses: agent_harnesses.md

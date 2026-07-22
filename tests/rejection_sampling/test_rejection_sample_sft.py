@@ -1,0 +1,210 @@
+"""Tests for rl_data/rejection_sample_sft.py — the STaR harvest+convert tool.
+
+Covers: reward filtering, format-error dropping, submit requirement, dedup,
+per-task cap (shortest-first), length cap, message sanitization to the SFT
+schema, and the contamination guard that refuses eval-sourced inputs.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+import rl_data.rejection_sample_sft as rs
+
+
+def _asst(cmd: str, content: str = "THOUGHT: go", tid: str = "c1") -> dict:
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {"id": tid, "type": "function", "function": {"name": "bash", "arguments": json.dumps({"command": cmd})}}
+        ],
+    }
+
+
+def _tool(content: str, tid: str = "c1") -> dict:
+    return {"role": "tool", "tool_call_id": tid, "content": content}
+
+
+def _traj(*cmds: str, submit: bool = True) -> list[dict]:
+    msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    for i, c in enumerate(cmds):
+        msgs.append(_asst(c, tid=f"c{i}"))
+        msgs.append(_tool("ok", tid=f"c{i}"))
+    if submit:
+        msgs.append(_asst(f"echo {rs.SUBMIT_MARKER}", tid="sub"))
+        msgs.append(_tool(rs.SUBMIT_MARKER, tid="sub"))
+    return msgs
+
+
+def _rec(task, reward, msgs):
+    return rs.Record(task, reward, msgs, "test")
+
+
+# --- filtering ---------------------------------------------------------------
+
+
+def test_only_passing_kept():
+    recs = [_rec("t1", 1.0, _traj("ls")), _rec("t1", 0.0, _traj("ls", "pwd"))]
+    ex = rs.harvest(recs, rs.HarvestConfig())
+    assert len(ex) == 1
+    assert ex[0]["id"] == "t1"
+
+
+def test_format_error_dropped():
+    bad = _traj("ls")
+    bad.insert(2, {"role": "assistant", "content": "no tool call here"})  # malformed action
+    st = rs.HarvestStats()
+    ex = rs.harvest([_rec("t1", 1.0, bad)], rs.HarvestConfig(), st)
+    assert ex == []
+    assert st.dropped_format_error == 1
+
+
+def test_malformed_tool_args_is_format_error():
+    m = _traj("ls")
+    m[2]["tool_calls"][0]["function"]["arguments"] = "{not json"
+    assert rs.has_format_error(m) is True
+
+
+def test_require_submit():
+    st = rs.HarvestStats()
+    ex = rs.harvest([_rec("t1", 1.0, _traj("ls", submit=False))], rs.HarvestConfig(), st)
+    assert ex == []
+    assert st.dropped_no_submit == 1
+
+
+def test_keep_when_not_requiring_submit():
+    cfg = rs.HarvestConfig(require_submit=False)
+    ex = rs.harvest([_rec("t1", 1.0, _traj("ls", submit=False))], cfg)
+    assert len(ex) == 1
+
+
+def test_length_cap():
+    huge = _traj("x" * 200000)
+    st = rs.HarvestStats()
+    ex = rs.harvest([_rec("t1", 1.0, huge)], rs.HarvestConfig(max_tokens=1000), st)
+    assert ex == []
+    assert st.dropped_too_long == 1
+
+
+def test_min_assistant_turns():
+    # a submit-only trajectory has 1 assistant turn; require 2
+    st = rs.HarvestStats()
+    ex = rs.harvest([_rec("t1", 1.0, _traj(submit=True))], rs.HarvestConfig(min_assistant_turns=2), st)
+    assert ex == []
+    assert st.dropped_too_short == 1
+
+
+# --- dedup + per-task cap ----------------------------------------------------
+
+
+def test_identical_action_sequences_deduped():
+    st = rs.HarvestStats()
+    recs = [_rec("t1", 1.0, _traj("ls", "pwd")), _rec("t1", 1.0, _traj("ls", "pwd"))]
+    ex = rs.harvest(recs, rs.HarvestConfig(), st)
+    assert len(ex) == 1
+    assert st.dropped_dup == 1
+
+
+def test_per_task_cap_keeps_shortest():
+    recs = [
+        _rec("t1", 1.0, _traj("a", "b", "c", "d")),  # long
+        _rec("t1", 1.0, _traj("a")),                  # short
+        _rec("t1", 1.0, _traj("a", "b")),             # mid
+    ]
+    st = rs.HarvestStats()
+    ex = rs.harvest(recs, rs.HarvestConfig(max_per_task=2), st)
+    assert len(ex) == 2
+    assert st.dropped_over_cap == 1
+    # shortest two kept: the 1-cmd and 2-cmd trajectories
+    kept_lens = sorted(len([m for m in e["messages"] if m["role"] == "assistant"]) for e in ex)
+    assert kept_lens == [2, 3]  # 1cmd+submit=2 asst, 2cmd+submit=3 asst
+
+
+def test_multiple_tasks_bucketed_independently():
+    recs = [_rec("t1", 1.0, _traj("a")), _rec("t2", 1.0, _traj("b"))]
+    ex = rs.harvest(recs, rs.HarvestConfig())
+    assert {e["id"] for e in ex} == {"t1", "t2"}
+
+
+# --- SFT schema --------------------------------------------------------------
+
+
+def test_sft_example_schema_and_sanitization():
+    m = _traj("ls")
+    # inject provider junk that must be stripped
+    m[2]["provider_specific_fields"] = {"x": 1}
+    m[2]["reasoning_content"] = "thinking..."
+    ex = rs.harvest([_rec("t1", 1.0, m)], rs.HarvestConfig())[0]
+    assert set(ex) == {"messages", "tools", "dataset", "id"}
+    assert ex["tools"] == [rs.BASH_TOOL]
+    asst = [x for x in ex["messages"] if x["role"] == "assistant"][0]
+    assert "provider_specific_fields" not in asst
+    assert asst["reasoning_content"] == "thinking..."  # preserved
+    tc = asst["tool_calls"][0]
+    assert set(tc) == {"id", "type", "function"}
+    assert json.loads(tc["function"]["arguments"]) == {"command": "ls"}
+
+
+# --- contamination guard -----------------------------------------------------
+
+
+def test_eval_source_refused(tmp_path):
+    p = tmp_path / "terminal-bench-2-1" / "run_summary.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"results": [{"reward": 1, "messages": _traj("ls")}]}))
+    with pytest.raises(ValueError, match="eval-sourced"):
+        list(rs.load_records([p]))
+
+
+def test_eval_source_allowed_with_override(tmp_path):
+    p = tmp_path / "evaluation_assets" / "run_summary.json"
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"results": [{"reward": 1, "messages": _traj("ls")}]}))
+    recs = list(rs.load_records([p], allow_eval_source=True))
+    assert len(recs) == 1 and recs[0].reward == 1.0
+
+
+# --- loading rl_data summary format -----------------------------------------
+
+
+def test_load_run_n_solutions_summary(tmp_path):
+    summ = {
+        "num_runs": 2,
+        "results": [
+            {"success": True, "reward": 1, "messages": _traj("ls")},
+            {"success": False, "reward": 0, "messages": _traj("nope", submit=False)},
+        ],
+    }
+    p = tmp_path / "gen-widget__abc_summary.json"
+    p.write_text(json.dumps(summ))
+    recs = list(rs.load_records([p]))
+    assert len(recs) == 2
+    assert [r.reward for r in recs] == [1.0, 0.0]
+    ex = rs.harvest(recs, rs.HarvestConfig())
+    assert len(ex) == 1  # only the passing one survives
+
+
+def test_load_jsonl(tmp_path):
+    p = tmp_path / "rollouts.jsonl"
+    with p.open("w") as f:
+        f.write(json.dumps({"task_id": "t1", "reward": 1, "messages": _traj("ls")}) + "\n")
+        f.write(json.dumps({"task_id": "t2", "reward": 0, "messages": _traj("x", submit=False)}) + "\n")
+    recs = list(rs.load_records([p]))
+    assert {r.task_id for r in recs} == {"t1", "t2"}
+
+
+def test_end_to_end_cli(tmp_path):
+    summ = {"results": [{"reward": 1, "messages": _traj("ls", "cat f")}]}
+    src = tmp_path / "gen-task__x_summary.json"
+    src.write_text(json.dumps(summ))
+    out = tmp_path / "sft.jsonl"
+    rc = rs.main([str(src), "--out", str(out)])
+    assert rc == 0
+    rows = [json.loads(l) for l in out.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["dataset"] == "tmax-rejection-sft"
+    assert rows[0]["tools"] == [rs.BASH_TOOL]
