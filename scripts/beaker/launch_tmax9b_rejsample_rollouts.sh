@@ -46,7 +46,7 @@ N_TASKS="${N_TASKS:-2000}"                            # first-round subset; rais
 PRIORITY="${PRIORITY:-high}"
 TEMPERATURE="${TEMPERATURE:-1.0}"                     # widen the attempt distribution
 JOB_NAME="${JOB_NAME:-tmax-9b-rejsample-rollouts-k${N_ATTEMPTS}}"
-REPO_REF="${REPO_REF:-__PINNED_SHA__}"
+REPO_REF="${REPO_REF:-1ed549c3d44cbec0d6910bfabfa28c2db61c9078}"
 
 ./beaker_configs/launch_eval.sh allenai/tmax-9b \
     --revision main \
