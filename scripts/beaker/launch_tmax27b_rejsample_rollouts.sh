@@ -60,7 +60,7 @@ REPO_REF="${REPO_REF:-358ffb91f7512463e64de1ccff3dd24be679c599}"
     --mirror-url jupiter-cs-aus-137.reviz.ai2.in:5000 \
     --model-provider openai \
     --language-model-only \
-    --max-model-len 65536 \
+    --max-model-len "${MAX_MODEL_LEN:-32768}" \
     --dataset "$DATASET" \
     --n-attempts "$N_ATTEMPTS" \
     --n-tasks "$N_TASKS" \
