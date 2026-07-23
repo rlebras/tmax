@@ -50,7 +50,7 @@ TEMPERATURE="${TEMPERATURE:-0.7}"                     # moderate; teacher is rel
 JOB_NAME="${JOB_NAME:-tmax-27b-rejsample-teacher-k${N_ATTEMPTS}}"
 GPUS="${GPUS:-2}"
 TP="${TP:-2}"
-REPO_REF="${REPO_REF:-__PINNED_SHA__}"
+REPO_REF="${REPO_REF:-358ffb91f7512463e64de1ccff3dd24be679c599}"
 
 ./beaker_configs/launch_eval.sh allenai/tmax-27b \
     --revision main \
