@@ -116,6 +116,17 @@ class HarvestConfig:
     # max_solve_rate=1.0 keeps everything solvable; lower it (e.g. 0.8) to drop
     # already-reliable tasks and concentrate on the flaky payoff band.
     max_solve_rate: float = 1.0
+    # Teacher-distillation (gap) mode: when student_rates are supplied to
+    # harvest(), select tasks by the STUDENT's weakness instead of the
+    # harvested (teacher) model's own solve-rate — keep a task iff the student
+    # solves it at rate <= max_student_solve_rate (student_rate==0 INCLUDED:
+    # those are the pure capability imports self-sampling can't reach).
+    # max_student_solve_rate=1.0 distills broadly; lower it to focus the gap.
+    max_student_solve_rate: float = 1.0
+    # Optional total-task budget: keep only the N highest-gap tasks
+    # (teacher_rate - student_rate), i.e. where the student is weakest relative
+    # to the teacher. None = no cap. Only meaningful in gap mode.
+    max_tasks: int | None = None
     tools: list = field(default_factory=lambda: [BASH_TOOL])
 
 
@@ -136,6 +147,11 @@ class HarvestStats:
     tasks_solvable: int = 0            # tasks with >=1 success (harvestable at all)
     tasks_over_solve_rate: int = 0     # solvable tasks skipped by max_solve_rate
     solve_rate_hist: dict = field(default_factory=dict)  # coarse solve-rate buckets over solvable tasks
+    # gap-mode only:
+    gap_mode: bool = False
+    tasks_student_reliable: int = 0    # tasks skipped because the student already solves them (> max_student_solve_rate)
+    tasks_pure_import: int = 0         # kept tasks the student never solves (student_rate==0)
+    tasks_over_budget: int = 0         # tasks dropped by max_tasks budget (lowest gap)
     per_task_kept: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
@@ -390,6 +406,19 @@ def to_sft_example(task_id: str, messages: list[dict], tools: list) -> dict:
     }
 
 
+def compute_solve_rates(records: Iterable[Record]) -> dict[str, float]:
+    """Per-task solve-rate (fraction of attempts with reward>=1) over all
+    attempts in *records*. Used to read the student's per-task competence in
+    gap (teacher-distillation) mode."""
+    totals: dict[str, int] = defaultdict(int)
+    succ: dict[str, int] = defaultdict(int)
+    for rec in records:
+        totals[rec.task_id] += 1
+        if rec.reward >= 1.0:
+            succ[rec.task_id] += 1
+    return {t: succ[t] / n for t, n in totals.items() if n}
+
+
 def _solve_rate_bucket(rate: float) -> str:
     if rate >= 1.0:
         return "1.0 (always)"
@@ -402,21 +431,39 @@ def _solve_rate_bucket(rate: float) -> str:
     return "(0,0.25)"
 
 
-def harvest(records: Iterable[Record], config: HarvestConfig, stats: HarvestStats | None = None) -> list[dict]:
+def harvest(
+    records: Iterable[Record],
+    config: HarvestConfig,
+    stats: HarvestStats | None = None,
+    student_rates: dict[str, float] | None = None,
+) -> list[dict]:
     """Filter passing records into cleaned, deduped SFT examples.
 
-    Two passes. First, compute each task's solve-rate across ALL its attempts
-    and keep only tasks in the relevant band (``0 < rate <= max_solve_rate``) —
-    rejection sampling has nothing to teach on always-solved tasks and nothing
-    to harvest on never-solved ones. Second, from the in-band tasks, filter the
-    passing trajectories (clean, submit, length), dedup, and cap per task
-    (SHORTEST first — cheapest correct demonstrations, least flailing).
-    Deterministic given the same records.
+    Two selection modes, chosen by ``student_rates``:
+
+    * **Self mode** (``student_rates is None``): the records ARE the model
+      whose successes we distill. Keep tasks in the relevant band
+      (``0 < harvested_rate <= max_solve_rate``) — nothing to teach on
+      always-solved tasks, nothing to harvest on never-solved ones.
+
+    * **Gap / teacher-distillation mode** (``student_rates`` given): the
+      records are the TEACHER's rollouts; ``student_rates`` is the STUDENT's
+      per-task solve-rate (from a separate rollout set). Keep a task iff the
+      teacher solved it at all AND the student solves it at rate <=
+      ``max_student_solve_rate`` — so we import capability where the student
+      is weak, INCLUDING tasks it never solves (student_rate 0), which self
+      mode cannot reach. With ``max_tasks`` set, keep only the highest-gap
+      (teacher_rate - student_rate) tasks.
+
+    Then, from the in-focus tasks, filter passing trajectories (clean, submit,
+    length), dedup, and cap per task (SHORTEST first — cheapest correct
+    demonstrations, least flailing). Deterministic given the same inputs.
     """
     stats = stats or HarvestStats()
+    stats.gap_mode = student_rates is not None
     records = list(records)
 
-    # Pass 1 — per-task solve-rate over all attempts.
+    # Pass 1 — per-task solve-rate of the harvested (self/teacher) model.
     totals: dict[str, int] = defaultdict(int)
     successes: dict[str, int] = defaultdict(int)
     for rec in records:
@@ -425,20 +472,40 @@ def harvest(records: Iterable[Record], config: HarvestConfig, stats: HarvestStat
             successes[rec.task_id] += 1
     stats.tasks_seen = len(totals)
     focus: set[str] = set()
+    gaps: dict[str, float] = {}
     for tid, n in totals.items():
         rate = successes[tid] / n if n else 0.0
         if successes[tid] == 0:
-            continue  # never solved: nothing to harvest
+            continue  # never solved by the harvested model: nothing to harvest
         stats.tasks_solvable += 1
         stats.solve_rate_hist[_solve_rate_bucket(rate)] = (
             stats.solve_rate_hist.get(_solve_rate_bucket(rate), 0) + 1
         )
-        if rate > config.max_solve_rate:
-            stats.tasks_over_solve_rate += 1
-            continue  # already reliable: skip the redundant demonstrations
-        focus.add(tid)
+        if student_rates is None:
+            # self mode: focus band on the harvested model's own rate
+            if rate > config.max_solve_rate:
+                stats.tasks_over_solve_rate += 1
+                continue
+            focus.add(tid)
+        else:
+            # gap mode: focus on tasks the STUDENT is weak on
+            s_rate = student_rates.get(tid, 0.0)
+            if s_rate > config.max_student_solve_rate:
+                stats.tasks_student_reliable += 1
+                continue
+            gaps[tid] = rate - s_rate
+            if s_rate == 0.0:
+                stats.tasks_pure_import += 1
+            focus.add(tid)
 
-    # Pass 2 — harvest passing trajectories from in-band tasks only.
+    # Optional gap-mode budget: keep only the highest-gap tasks.
+    if student_rates is not None and config.max_tasks is not None and len(focus) > config.max_tasks:
+        ranked = sorted(focus, key=lambda t: (-gaps.get(t, 0.0), t))
+        kept_focus = set(ranked[: config.max_tasks])
+        stats.tasks_over_budget = len(focus) - len(kept_focus)
+        focus = kept_focus
+
+    # Pass 2 — harvest passing trajectories from in-focus tasks only.
     candidates: dict[str, list[tuple[int, str, list[dict]]]] = defaultdict(list)
     seen_keys: set[str] = set()
 
@@ -528,6 +595,30 @@ def main(argv: list[str] | None = None) -> int:
         "solvable tasks; lower (e.g. 0.8) to focus on the flaky payoff band and "
         "drop already-reliable tasks.",
     )
+    ap.add_argument(
+        "--student-rollouts",
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help="TEACHER-DISTILLATION mode: the student's own rollouts (same task "
+        "corpus). Switches selection to the teacher-minus-student gap — keep "
+        "tasks the student is weak on (see --max-student-solve-rate), including "
+        "ones it never solves. `inputs` are then the TEACHER's rollouts.",
+    )
+    ap.add_argument(
+        "--max-student-solve-rate",
+        type=float,
+        default=1.0,
+        help="gap mode: keep only tasks the student solves at rate <= this. "
+        "1.0 distills the teacher broadly; lower (e.g. 0.6) to focus the "
+        "capability gap where the student is weakest.",
+    )
+    ap.add_argument(
+        "--max-tasks",
+        type=int,
+        default=None,
+        help="gap mode: cap to the N highest-gap (teacher-minus-student) tasks.",
+    )
     ap.add_argument("--keep-format-errors", action="store_true", help="do NOT drop malformed-action trajectories")
     ap.add_argument("--no-require-submit", action="store_true", help="keep trajectories not ending on the submit marker")
     ap.add_argument(
@@ -550,12 +641,20 @@ def main(argv: list[str] | None = None) -> int:
         max_tokens=args.max_tokens,
         min_assistant_turns=args.min_assistant_turns,
         max_solve_rate=args.max_solve_rate,
+        max_student_solve_rate=args.max_student_solve_rate,
+        max_tasks=args.max_tasks,
         drop_format_errors=not args.keep_format_errors,
         require_submit=not args.no_require_submit,
     )
     stats = HarvestStats()
+    student_rates = None
+    if args.student_rollouts:
+        student_rates = compute_solve_rates(
+            load_records(_expand_inputs(args.student_rollouts), allow_eval_source=args.allow_eval_source)
+        )
+        print(f"gap mode: read student solve-rates for {len(student_rates)} tasks", file=sys.stderr)
     records = load_records(_expand_inputs(args.inputs), allow_eval_source=args.allow_eval_source, stats=stats)
-    examples = harvest(records, cfg, stats)
+    examples = harvest(records, cfg, stats, student_rates=student_rates)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -567,11 +666,18 @@ def main(argv: list[str] | None = None) -> int:
     report.pop("per_task_kept", None)
     hist = report.pop("solve_rate_hist", {})
     print(json.dumps(report, indent=2))
-    print("\nsolve-rate distribution over solvable tasks (where the harvestable signal is):")
+    label = "teacher" if stats.gap_mode else "harvested-model"
+    print(f"\n{label} solve-rate distribution over solvable tasks:")
     for bucket in ["(0,0.25)", "[0.25,0.5)", "[0.5,0.75)", "[0.75,1.0)", "1.0 (always)"]:
         if bucket in hist:
-            note = "  <- redundant (already reliable)" if bucket == "1.0 (always)" else ""
+            note = "" if stats.gap_mode else ("  <- redundant (already reliable)" if bucket == "1.0 (always)" else "")
             print(f"  {bucket:14s} {hist[bucket]}{note}")
+    if stats.gap_mode:
+        print(
+            f"\ngap mode: {stats.tasks_pure_import} kept tasks the student NEVER solves "
+            f"(pure capability imports); {stats.tasks_student_reliable} tasks skipped "
+            f"(student already >{args.max_student_solve_rate})."
+        )
     print(f"\nwrote {len(examples)} SFT examples across {report['n_tasks_kept']} tasks to {out}")
     if args.stats_out:
         Path(args.stats_out).write_text(json.dumps(stats.as_dict(), indent=2) + "\n")

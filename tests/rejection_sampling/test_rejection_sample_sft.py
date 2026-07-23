@@ -304,6 +304,62 @@ def test_solve_rate_histogram_counts_solvable_tasks():
     assert st.solve_rate_hist.get("[0.5,0.75)") == 1
 
 
+# --- gap / teacher-distillation mode -----------------------------------------
+
+
+def test_compute_solve_rates():
+    recs = [
+        _rec("a", 1.0, _traj("x")), _rec("a", 0.0, _traj("y", submit=False)),  # 0.5
+        _rec("b", 1.0, _traj("x")), _rec("b", 1.0, _traj("y")),                # 1.0
+        _rec("c", 0.0, _traj("z", submit=False)),                             # 0.0
+    ]
+    rates = rs.compute_solve_rates(recs)
+    assert rates == {"a": 0.5, "b": 1.0, "c": 0.0}
+
+
+def test_gap_mode_keeps_student_weak_including_never_solved():
+    # teacher solves all three; student: aces t_easy, flaky on t_mid, never on t_hard
+    teacher = [
+        _rec("t_easy", 1.0, _traj("a")),
+        _rec("t_mid", 1.0, _traj("b")),
+        _rec("t_hard", 1.0, _traj("c")),
+    ]
+    student_rates = {"t_easy": 1.0, "t_mid": 0.4, "t_hard": 0.0}
+    st = rs.HarvestStats()
+    ex = rs.harvest(teacher, rs.HarvestConfig(max_student_solve_rate=0.8), st, student_rates=student_rates)
+    ids = {e["id"] for e in ex}
+    assert ids == {"t_mid", "t_hard"}        # t_easy dropped (student already reliable)
+    assert st.gap_mode is True
+    assert st.tasks_student_reliable == 1     # t_easy
+    assert st.tasks_pure_import == 1          # t_hard (student never solves) — the key import
+
+
+def test_gap_mode_distill_broadly_by_default():
+    teacher = [_rec("t_easy", 1.0, _traj("a")), _rec("t_hard", 1.0, _traj("c"))]
+    student_rates = {"t_easy": 1.0, "t_hard": 0.0}
+    st = rs.HarvestStats()
+    ex = rs.harvest(teacher, rs.HarvestConfig(max_student_solve_rate=1.0), st, student_rates=student_rates)
+    assert {e["id"] for e in ex} == {"t_easy", "t_hard"}  # broad: nothing dropped for reliability
+    assert st.tasks_student_reliable == 0
+
+
+def test_gap_mode_still_rejects_teacher_failures():
+    # a task the teacher only fails on yields nothing, even though student is weak
+    teacher = [_rec("t_hard", 0.0, _traj("c", submit=False))]
+    ex = rs.harvest(teacher, rs.HarvestConfig(), rs.HarvestStats(), student_rates={"t_hard": 0.0})
+    assert ex == []
+
+
+def test_gap_mode_max_tasks_keeps_highest_gap():
+    # teacher solves all; gaps: t1=1.0-0.1=0.9, t2=1.0-0.5=0.5, t3=1.0-0.8=0.2
+    teacher = [_rec("t1", 1.0, _traj("a")), _rec("t2", 1.0, _traj("b")), _rec("t3", 1.0, _traj("c"))]
+    student_rates = {"t1": 0.1, "t2": 0.5, "t3": 0.8}
+    st = rs.HarvestStats()
+    ex = rs.harvest(teacher, rs.HarvestConfig(max_tasks=2), st, student_rates=student_rates)
+    assert {e["id"] for e in ex} == {"t1", "t2"}   # the two widest gaps
+    assert st.tasks_over_budget == 1
+
+
 def test_end_to_end_cli(tmp_path):
     summ = {"results": [{"reward": 1, "messages": _traj("ls", "cat f")}]}
     src = tmp_path / "gen-task__x_summary.json"

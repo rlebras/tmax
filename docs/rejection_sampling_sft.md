@@ -139,6 +139,43 @@ The harvest/convert tool is unit-tested
 end-to-end on real production trajectories. Steps 1 and 3 are GPU cluster jobs
 (vLLM rollout generation; multi-node SFT) — launch them as usual.
 
+## Teacher distillation (27B → 9B) — the higher-value variant
+
+Self-rejection-sampling can only reinforce what the 9B already reaches; it
+can't add capability. Distilling from a stronger teacher can. On terminal-bench
+the **27B's pass@1 is 44.9% vs the 9B's 29.0%** — a large, real edge — so
+importing the 27B's verified successes is the higher-ceiling move (realistic
+9B target: mid-to-high 30s, bounded below 44.9% by the capacity gap).
+
+The selection rule **inverts** relative to self mode. There you drop
+already-reliable tasks (`--max-solve-rate`). Here you keep tasks by the
+**teacher−student gap** — where the *student* is weak, including tasks the 9B
+*never* solves (those are the pure capability imports self-sampling can't
+touch). Rejection filtering still applies to the teacher (keep only its
+verifier-passing trajectories — don't distill the 27B's errors).
+
+```bash
+# [1a] student solve-rates: roll out the 9B on the corpus (cheap)
+bash scripts/beaker/launch_tmax9b_rejsample_rollouts.sh          # N_ATTEMPTS>=4
+
+# [1b] teacher successes: roll out the 27B on the same corpus (k=4, TP=2)
+bash scripts/beaker/launch_tmax27b_rejsample_rollouts.sh
+
+# [2] harvest in GAP mode: teacher inputs + student rollouts
+uv run python -m rl_data.rejection_sample_sft <27b jobs/ dir> \
+    --student-rollouts <9b jobs/ dir> \
+    --max-student-solve-rate 0.8 \   # keep tasks the 9B solves <=80% (incl. never)
+    --out rl_data/output/distill_sft.jsonl --push-to-hub <you>/tmax-distill-sft
+```
+
+**How many teacher rollouts?** Not k=1 (even at 44.9% pass@1): pass@k > pass@1,
+so extra samples recover the harder tasks the 27B solves only sometimes — the
+ones the 9B most needs — and give a pool to pick a clean demonstration from.
+Not k=16 either (wasteful on a reliable teacher). Use k≈4, or the adaptive
+two-pass version: cheap k=2 everywhere, then top up k≈6–8 *only* on the tasks
+still unsolved (spends the expensive 27B compute where coverage is incomplete,
+which is also where the 9B is weakest). Keep 1–3 demos per task regardless.
+
 ## Honest expectations
 
 Rejection-sampling SFT reliably lifts pass@1 toward the *current* pass@5 ceiling
